@@ -1,5 +1,16 @@
 # singularity-crush — Migration Notes
 
+> **Status: superseded research notes.** This document was the working draft that SPEC.md was synthesised from. **For implementation, follow [SPEC.md](./SPEC.md), which is the authoritative specification.**
+>
+> Specifically out of date in this document:
+> - **Knowledge layer storage** (the `## Memory and knowledge` section): the long sqlite-vec + FTS5 + RRF + reranker pipeline does not apply. SPEC.md uses Hindsight as the sole knowledge backend; sf does not call any embedding or reranker endpoint directly. The `memories` SQLite schema, `F32_BLOB(2560)`, `vector_top_k()`, `Qwen3-Reranker-0.6B/4B` tier discussion, and the `KNOWLEDGE.md` replacement table are all stale.
+> - References to `hermes-memory` and `hermes_memory_*` tools are stale. Use the Hindsight client interface defined in SPEC.md § 16.1.1.
+> - The "Implementation conformance checklist" near the bottom predates SPEC.md § 26's 90+ numbered items with [REQUIRED] / [STRONG] / [OPTIONAL] tags.
+>
+> The rest (Crush feature inventory, what to build vs. inherit, plugin extension points, Vault secret management, charmbracelet/x package picks, skills, /sf revert protocol, dispatch scheduling) is broadly aligned with SPEC.md but with less precision. Use SPEC.md for canonical wording.
+
+---
+
 ## What this is
 
 **singularity-crush is Crush on autopilot.**
@@ -7,7 +18,7 @@
 Crush is an interactive coding agent — you drive it turn by turn. singularity-crush adds the autopilot layer on top: when pointed at an existing codebase it maps it, builds the harness, and populates the knowledge store — then drives itself through research → plan → execute → verify → complete without human intervention per unit.
 
 Concretely, `sf init` in an existing project:
-1. Indexes the codebase into SQLite (FTS5 + Qwen3-Embedding-4B vectors)
+1. Indexes the codebase into Hindsight under the project bank (§ 16.3 of SPEC.md)
 2. Extracts initial patterns and conventions into the memory store
 3. Sets up `.sf/config.toml` with project-specific harness config
 4. Establishes the session contract and runs doctor checks
@@ -389,175 +400,18 @@ Both write the same benchmark result format with quality score (`over=0.3`, `ok=
 
 The routing decision is `(phase, complexity, benchmark_history) → model`. Pure function, no external dependencies, no algorithm variation needed. Config + SQLite + a thin Go scorer. If a user needs different weights or different tiers, they change TOML — they do not recompile.
 
-## Memory and knowledge — Hindsight
+## Memory and knowledge — Hindsight (superseded section)
 
-SF's flat `KNOWLEDGE.md` and the planned Hivemind Go implementation are both replaced by **Hindsight** ([vectorize-io/hindsight](https://github.com/vectorize-io/hindsight-cookbook)) — a production memory service already used by hermes-memory.
-
-**Why Hindsight instead of building it:**
-- hermes-memory already integrates with it (vendors `hindsight_api` + `hindsight_client`)
-- Go client available (`hindsight-client-go`) — no new language needed
-- Four parallel retrieval strategies: semantic + keyword (BM25) + graph + temporal — more capable than sqlite-vec + FTS5 alone
-- All tools share the same memory banks — patterns from singularity-crush sessions are available in Hermes and ace and vice versa
-- Backed by pg0 (PostgreSQL) with VectorChord for vectors
-
-**Integration:** use `hindsight-client-go` in singularity-crush. Pre-dispatch: `recall`. Post-unit: `retain`. Periodically: `reflect` to synthesise insights from accumulated memories.
-
-**SQLite in singularity-crush** then only holds: session state, planning data, phase transitions, benchmark scores. Not knowledge.
-
-Reference: [syntax-syndicate/opencode-swarm-tools](https://github.com/syntax-syndicate/opencode-swarm-tools) Hivemind — design inspiration for maturation and decay patterns, even though Hindsight is the actual backend.
-
-### Memory tiers
-
-Two explicit tiers prevent token bloat during long-running sessions:
-
-**Hot cache** — last 10 turns of the current unit, held in memory (not SQLite). Fast path for immediate reasoning. Never injected into the next unit's context — it's the live conversation window, not persistent memory.
-
-**Hindsight store** — the durable layer. PostUnit writes summaries, learnings, and anti-patterns here. Pre-dispatch reads the top-N most relevant entries. This is what Hindsight manages.
-
-The harness never mixes the two. When compaction fires (budget at 80%), the hot cache is summarised and the summary is written to Hindsight as a `session_summary` entry — the hot cache is then cleared. The next dispatch starts with a fresh context window seeded by Hindsight recall, not a truncated version of the old window.
-
-### Anti-pattern library (correct once, learns forever)
-
-Beyond normal memory entries, Hindsight maintains a separate `anti_patterns` collection. Entries here are:
-- Written explicitly when the agent makes a mistake and is corrected (either by a gate failure or by user feedback)
-- Tagged `collection: anti_patterns` with `is_negative: true`
-- Retrieved at dispatch time alongside normal memories, but presented in a dedicated block: `<anti_patterns>avoid these mistakes...</anti_patterns>`
-- Never subject to normal maturation decay — anti-patterns persist at full weight until explicitly removed
-
-The distinction matters: normal memories decay when not accessed (good patterns that stopped being relevant fade). Anti-patterns don't decay — a mistake made once is worth surfacing indefinitely.
-
-```go
-type AntiPattern struct {
-    ID          string
-    Description string    // what went wrong
-    Context     string    // when/where this applies
-    CorrectPath string    // what to do instead
-    SourceUnit  string    // unit ID where the mistake occurred
-    CreatedAt   time.Time
-}
-```
-
-### Storage
-
-**sqlite-vec** with `F32_BLOB(2560)` columns in the same SQLite DB Crush already uses (`ncruces/go-sqlite3`). No extra processes, no separate index files. FTS5 virtual table alongside for BM25 hybrid search — FTS5 is the fallback when the embedding endpoint is unreachable.
-
-**Performance is more than adequate for this use case.** SQLite is the right choice for a single-user CLI tool: sub-millisecond FTS5 queries, ANN vector search handles up to ~1M vectors, a large codebase index is ~100k chunks at most. PostgreSQL + pgvector (what ace uses) is the right choice for multi-user production infrastructure — not for a binary that needs to start in milliseconds. Always enable WAL mode:
-
-```go
-db.Exec("PRAGMA journal_mode=WAL")
-db.Exec("PRAGMA synchronous=NORMAL") // safe with WAL, significantly faster writes
-```
-
-WAL allows concurrent reads during writes — important when parallel workers write memories while the main loop reads them.
-
-Embedding via `https://llm-gateway.centralcloud.com/v1/embeddings`, reranking via `/v1/rerank`. OpenAI-compatible API — use `charmbracelet/openai-go` already in go.mod, no new dependency. API key from Vault:
-
-Both embedding and reranking come in two sizes — use the right one for the context:
-
-| Operation | Model | When |
-|---|---|---|
-| Query embedding | `qwen3-embedding-0.6B` | Real-time, during retrieval |
-| Index embedding | `qwen3-embedding-4B` (2560 dims) | Building codebase index, storing memories |
-| Routine rerank | `Qwen3-Reranker-0.6B` | Auto-loop queries |
-| Pre-dispatch rerank | `Qwen3-Reranker-4B` | Context injection before each unit — quality matters most here |
-
-```json
-{ "embedding_api_key": "vault://secret/singularity-crush#inference_fabric_key" }
-```
-
-Graceful degradation to FTS5-only if the endpoint is unreachable (offline, tailnet down).
-
-### Pattern maturation
-
-Every stored knowledge entry has a maturity state:
-
-| State | Condition | Weight in retrieval |
-|---|---|---|
-| Candidate | < 3 observations | 0.5x |
-| Established | ≥ 3 obs, harmful ratio < 30% | 1.0x |
-| Proven | decayed helpful score ≥ 5, harmful ratio < 15% | 1.5x |
-| Deprecated | harmful ratio > 30% | 0x (excluded) |
-
-Anti-pattern detection: after 3 failed uses, content is prefixed `AVOID:` and flagged `is_negative: true`. Excluded from retrieval by default, surfaced explicitly on request.
-
-### Confidence decay
-
-Exponential half-life decay based on confidence at store time:
-
-```
-halfLife   = 90 * (0.5 + confidence)   // days; confidence ∈ [0.0, 1.0]
-decayFactor = 0.5 ^ (ageInDays / halfLife)
-finalScore  = similarityScore * decayFactor
-```
-
-This means:
-- High-confidence (1.0): 135-day half-life — slow decay
-- Default (0.7): 108-day half-life
-- Low-confidence (0.0): 45-day half-life — fast decay
-
-Memory access tiers used for filtering:
-- **Hot**: accessed within 7 days
-- **Warm**: accessed within 30 days
-- **Cold / Stale**: older
-
-Frequency bonus: entries with 10+ accesses gain a 7-day buffer against decay. Validation reset: when a memory directly aids task completion, calling `validate()` resets the 90-day decay timer.
-
-### Schema (extend Crush's `internal/db/`)
-
-```sql
-CREATE TABLE memories (
-    id           TEXT PRIMARY KEY,
-    content      TEXT NOT NULL,
-    embedding    F32_BLOB(2560),  -- Qwen3-Embedding-4B
-    decay_factor REAL DEFAULT 1.0,
-    confidence   REAL DEFAULT 0.7,     -- affects half-life
-    maturity     TEXT DEFAULT 'candidate',
-    is_negative  INTEGER DEFAULT 0,
-    helpful_hits INTEGER DEFAULT 0,
-    harmful_hits INTEGER DEFAULT 0,
-    access_count INTEGER DEFAULT 0,
-    collection   TEXT DEFAULT 'default',
-    tags         TEXT,                 -- JSON array
-    last_accessed TEXT,
-    valid_until  TEXT,
-    superseded_by TEXT,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-
-CREATE VIRTUAL TABLE memories_fts USING fts5(content, tags, content=memories);
-CREATE INDEX memories_vector ON memories USING libsql_vector_idx(embedding);
-```
-
-### Retrieval
-
-Two-stage pipeline — fast broad retrieval then accurate reranking:
-
-**Stage 1 — retrieval (broad, top 20-50 candidates):**
-1. Generate query embedding via `llm-gateway.centralcloud.com/v1/embeddings` (Qwen3-Embedding-0.6B — fast, real-time)
-2. ANN search via `vector_top_k()` — cosine distance → similarity score
-3. FTS5 search in parallel — `bm25()` is BM25, built into SQLite, no extra library
-4. **Reciprocal Rank Fusion**: `rrf = 1/(60 + vector_rank) + 1/(60 + fts5_rank)`
-
-**Stage 2 — reranking (precise, top 5-10 returned):**
-5. Send (query, document) pairs to reranker at `llm-gateway.centralcloud.com/v1/rerank`
-   - **0.6B** (`Qwen/Qwen3-Reranker-0.6B`) — default, fast, used for most queries
-   - **4B** (`Qwen/Qwen3-Reranker-4B`) — accurate, used for pre-dispatch context injection where quality matters most
-6. Apply decay: `finalScore = rerankerScore * decayFactor`
-7. Filter deprecated (`0x`) and below threshold
-8. Apply maturity weights
-9. Return top N sorted by finalScore
-
-Cross-encoders (rerankers) understand query-document relationships far better than bi-encoder similarity alone. The two-stage approach keeps latency low — reranker only sees 20-50 candidates, not the full store.
-
-Pre-dispatch auto-recall: before each unit dispatch, the harness queries `collection: 'default'` filtered to `hot` tier, injects top 3 as context. This replaces SF's static `KNOWLEDGE.md` injection.
-
-### What this replaces in SF
-
-- `KNOWLEDGE.md` — replaced by the memories table, `collection: 'knowledge'`
-- `/sf knowledge add` — `memory.Store(content, confidence)`
-- `/sf codebase rag` — `memory.Search(query)` over `collection: 'codebase'`
-- `context-injector.ts` — harness pre-dispatch hook reads hot memories and injects
+> **Superseded.** Earlier drafts of this section described a layered local pipeline (sqlite-vec + FTS5 + RRF + cross-encoder reranker via `llm-gateway.centralcloud.com/v1/rerank`, with `Qwen3-Reranker-0.6B` for routine queries and `Qwen3-Reranker-4B` for pre-dispatch context). **That model was dropped during SPEC.md v0.2.** The current architecture:
+>
+> - **Hindsight is the sole knowledge backend.** sf does not call any embedding endpoint, any reranker endpoint, or run any local vector index. Hindsight handles all retrieval and reranking server-side.
+> - **No `memories` SQLite table, no `F32_BLOB`, no `libsql_vector_idx`, no `vector_top_k()`.** SQLite in sf is orchestration-only.
+> - The `local_anti_patterns` mirror is the one exception: a small SQLite table that survives Hindsight outage so anti-patterns still inject into context.
+> - On Hindsight unreachable: log warning, dispatch with empty recall (plus local anti-patterns). Do NOT fall back to FTS5 — there is no FTS5.
+>
+> See SPEC.md §§ 16.1, 16.1.1 (Hindsight client interface — Recall / Retain / Feedback / Validate / Health), 16.4 (anti-patterns), 16.7 (retrieval delegation to Hindsight).
+>
+> What's still useful from this section's research: anti-pattern semantics, confidence decay formula, two-bank pattern (project/global). Those concepts survived; the local-pipeline implementation didn't.
 
 ## SSH / Wishlist integration (bonus)
 

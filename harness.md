@@ -1,5 +1,15 @@
 # Harness Engineering Practices
 
+> **Status: superseded research notes.** This document was the working draft that SPEC.md was synthesised from. **For implementation, follow [SPEC.md](./SPEC.md), which is the authoritative specification.**
+>
+> Specifically out of date in this document:
+> - Knowledge layer: this doc still says "hermes-memory" with `hermes_memory_*` tools and a local memory pipeline. **SPEC.md uses Hindsight as the sole knowledge backend** — no local sqlite-vec, no embedding/reranker calls from the harness, no hermes-memory plugin. Hindsight handles retrieval and reranking server-side.
+> - Anti-pattern detection details, in-process embedding, and reranker tier discussion in this file no longer apply.
+>
+> The rest (phase state machine, hooks, supervisor checks, worktree isolation, distributed execution, trust boundary) is broadly aligned with SPEC.md but with less precision. Use SPEC.md for the canonical wording.
+
+---
+
 Engineering practices for the singularity-crush agent harness. The goal is to define clean boundaries from day one so practices that were bolted onto SF over time (dispatch-guard, exec-sandbox, auto-recovery, context-budget, auto-supervisor, abandon-detect — all separate files, all added later) are instead structural from the start.
 
 ## What Crush already provides
@@ -405,35 +415,16 @@ post_unit    = ["./hooks/post-unit.sh"]
 
 `max_agents_by_phase` limits how many units can be in a given phase simultaneously across all running agents. This prevents resource contention — e.g. capping concurrent `execute` phases stops 10 agents from all hammering the same codebase at once while `verify` phases (which only read) can run freely.
 
-## 9. Knowledge layer via hermes-memory
+## 9. Knowledge layer
 
-The knowledge layer is **hermes-memory**: a Hermes plugin installed at `$HERMES_HOME/plugins/hermes_memory/`. It is not an interface the harness calls directly — Hermes orchestrates the full lifecycle. The harness boundary is narrow: emit the right events with the right payload, let hermes-memory do the rest.
-
-**How it works:**
-
-- Hermes calls `prefetch()` before each dispatch and injects retrieved memories into the agent's system prompt via `system_prompt_block()`. The harness does not manage this — it is automatic once hermes-memory is registered as the active provider.
-- After each unit, the harness PostUnit hook (§ 10) can explicitly store learnings by calling the `hermes_memory_store` tool or by including a `learnings` field in the PostUnit payload. hermes-memory's `on_memory_write()` handler persists them.
-- After a successful unit, the harness emits a positive feedback signal via `hermes_memory_feedback`. This resets the decay timer on memories that were recalled during that unit.
-
-**Backend:**
-Postgres (durable storage), local file (dev and tests). Dense embeddings via `llm-gateway.centralcloud.com/v1/embeddings` (Qwen3 4B, 2560d vectors). Lexical retrieval via BM25. Fused ranking via reciprocal-rank fusion. Optional reranking via `llm-embedding.centralcloud.com/v1`.
-
-**Tools the agent can call directly during a unit:**
-
-| Tool | Purpose |
-|------|---------|
-| `hermes_memory_search` | Semantic + lexical search across stored memories |
-| `hermes_memory_context` | Retrieve context-relevant memories for the current task |
-| `hermes_memory_store` | Explicitly store a learning or insight |
-| `hermes_memory_feedback` | Signal helpfulness (positive or negative) for a memory |
-
-The agent calling these tools is the primary write path. The harness only calls them from PostUnit hooks — it does not maintain a memory client itself.
-
-**Anti-pattern detection:**
-hermes-memory tracks negative feedback counts per entry. After repeated `hermes_memory_feedback` calls with negative signal against the same memory, it marks the entry as a negative pattern. The harness emits the feedback signal after `Verdict: Failure`; hermes-memory owns all decay and flagging logic.
-
-**Hindsight loop:**
-After each unit (success or failure), the harness synthesizes a structured hindsight summary and stores it via `hermes_memory_store`. The summary includes: what was attempted, what succeeded, what failed, and what the agent should do differently next time. This is explicitly distinct from the task output — it is a self-reflection record. On failure, the hindsight entry is tagged `outcome:failure` and the anti-pattern decay starts immediately. Future units in the same session retrieve these entries via `hermes_memory_context` at dispatch time so the agent doesn't repeat the same mistakes within a session. Across sessions, the decayed entries surface only if the same context pattern is detected again.
+> **Superseded.** This section's earlier content described "hermes-memory" with `hermes_memory_*` tools, a local in-process embedding/reranker pipeline, and per-event Hermes plugin hooks. **That model is obsolete.** SPEC.md § 16 defines the actual knowledge layer:
+>
+> - **Hindsight is the sole knowledge backend.** The harness calls `hindsight.Recall(...)` / `hindsight.Retain(...)` / `hindsight.Feedback(...)` through a thin client wrapper.
+> - **No local sqlite-vec, no embedding endpoint, no reranker tier discussion.** Hindsight handles all of that server-side.
+> - **No hermes_memory_* tools.** Anti-patterns, learnings, and recall are managed through the Hindsight client, not exposed as agent-callable tools (except for explicit retain via PostUnit and explicit recall on dispatch).
+> - **`local_anti_patterns` SQLite mirror** is the only durable on-disk knowledge state; it preserves anti-patterns when Hindsight is unreachable.
+>
+> See SPEC.md §§ 16.1, 16.1.1 (Hindsight client interface), 16.4 (anti-patterns), 16.7 (retrieval delegation).
 
 ## 10. Post-unit hook pipeline
 
@@ -460,7 +451,7 @@ Hook execution rules:
 - Each hook runs in a child process (same pattern as `PreDispatch` hooks in config). The `UnitResult` is serialized to JSON and passed via stdin.
 - A hook that exits non-zero signals `SignalAbort` — the harness stops the session and marks it `SessionFailed`. A hook that times out (default 30s) is killed and logged but does not block the next dispatch.
 - The git service subscribes to PostUnit via a hook and handles commits, branch creation, and push. The harness knows nothing about git.
-- hermes-memory feedback is emitted from a built-in PostUnit hook, not a subprocess — it calls `hermes_memory_feedback` and, if `Learnings` is non-empty, calls `hermes_memory_store` for each entry.
+- Hindsight feedback (retain learnings, mark anti-patterns) is emitted from a built-in PostUnit hook, not a subprocess — it calls the Hindsight client directly. See SPEC.md § 16.1.1.
 - PostUnit hook results are written to the trace as child spans of the unit span.
 
 ## 11. Worktree isolation

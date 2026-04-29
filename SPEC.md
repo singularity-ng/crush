@@ -101,7 +101,7 @@ The slug encodes the parent hierarchy redundantly with `units.parent_id` to make
 
 **Orchestrator** — central process. Owns the scheduling loop, in-memory state, and all SQLite writes. Always runs locally even in distributed deployments.
 
-**Hindsight** — the durable knowledge store backed by a running Hindsight service. Holds memories, learnings, and anti-patterns across sessions and projects. Not SQLite — a separate service reachable on the tailnet.
+**Singularity Memory** (`sm`) — the durable knowledge layer. An HTTP + MCP server holding memories, learnings, and anti-patterns across sessions, projects, and tools. Originally derived from `vectorize-io/hindsight` (MIT) and assimilated into our codebase under `singularity_memory_server/`; we own the engine. Runs either embedded (in-process for single-user sf) or remote (shared service on tailnet, reachable from sf, Hermes, OpenClaw, Claude Code, Cursor, etc.). Not SQLite — knowledge lives in Singularity Memory; SQLite holds only orchestration state.
 
 **Skill** — a `SKILL.md` file providing prompt guidance to the agent. Inspirational, not enforced.
 
@@ -117,7 +117,7 @@ The slug encodes the parent hierarchy redundantly with `units.parent_id` to make
 
 ## 3. Data Model
 
-The orchestrator uses a single SQLite database **per project** at `<project>/.sf/sf.db` (or `~/.sf/sf.db` for non-project sessions) for **orchestration state only**: sessions, units, phase transitions, blockers, gate results, benchmarks, circuit breakers, and persistent agents. **Knowledge** (memories, learnings, anti-patterns, codebase context) lives in Hindsight (§ 16), not SQLite.
+The orchestrator uses a single SQLite database **per project** at `<project>/.sf/sf.db` (or `~/.sf/sf.db` for non-project sessions) for **orchestration state only**: sessions, units, phase transitions, blockers, gate results, benchmarks, circuit breakers, and persistent agents. **Knowledge** (memories, learnings, anti-patterns, codebase context) lives in Singularity Memory (§ 16), not SQLite.
 
 All primary keys for runtime-allocated rows (sessions, units, runs, agents, agent_messages, agent_inbox, gate_results, session_blockers, pending_retain) MUST be [ULIDs](https://github.com/ulid/spec) — sortable by creation time without a separate timestamp column. Schema-natural keys (model name, agent name) remain TEXT but are not ULIDs.
 
@@ -278,9 +278,9 @@ CREATE TABLE runs (
 -- marked archived (units.archived_at, agents.archived_at). The snap_ columns ensure
 -- run history survives even if a future operator manually drops rows.
 
--- Local mirror of selected Hindsight entries that the harness needs offline.
+-- Local mirror of selected Singularity Memory entries that the harness needs offline.
 -- Limited to anti-patterns by default — small, high-value, MUST surface even
--- if the Hindsight tailnet is down.
+-- if Singularity Memory is unreachable.
 CREATE TABLE local_anti_patterns (
     id           TEXT PRIMARY KEY,
     description  TEXT NOT NULL,
@@ -289,7 +289,7 @@ CREATE TABLE local_anti_patterns (
     source_unit  TEXT,
     fingerprint  TEXT,                        -- phase + project hash, for fast filter
     created_at   INTEGER NOT NULL,
-    synced_at    INTEGER                      -- last time confirmed against Hindsight
+    synced_at    INTEGER                      -- last time confirmed against Singularity Memory
 );
 ```
 
@@ -860,9 +860,9 @@ func (b *Budget) AtHardLimit() bool {
 
 When compaction fires (budget at compact threshold):
 
-1. Write a `session_summary` entry to Hindsight via `retain`.
+1. Write a `session_summary` entry to Singularity Memory via `retain`.
 2. Clear the hot cache (in-memory last-N turns).
-3. Start the next turn with a fresh context window seeded by a `recall` from Hindsight.
+3. Start the next turn with a fresh context window seeded by a `recall` from Singularity Memory.
 
 Compaction MUST NOT truncate the window — it MUST replace it with a fresh recall. A truncated window loses structure; a recalled window gains relevance.
 
@@ -1022,7 +1022,7 @@ The payload is serialized to JSON and passed to hook subprocesses via stdin.
 
   All overridable in config via `[harness.hooks.timeouts.<hook_name>] = "<duration>"`. A timeout kills the hook and logs. A `PostUnit` hook timeout MUST NOT block the next dispatch.
 - The git service subscribes to PostUnit via a hook and handles commits, branch creation, and push. The harness MUST NOT call `git` directly.
-- Hindsight feedback (retain learnings, mark anti-patterns) is emitted from a built-in PostUnit hook (not a subprocess) — it calls the Hindsight client directly.
+- Singularity Memory feedback (retain learnings, mark anti-patterns) is emitted from a built-in PostUnit hook (not a subprocess) — it calls the Singularity Memory client directly.
 - PostUnit hook results MUST be written to the trace as child spans of the unit span.
 
 ### 10.4 Tool response contract
@@ -1356,6 +1356,13 @@ stderr    = false
 [server]
 port = 7842   # 0 = ephemeral (tests)
 
+[memory]
+mode    = "embedded"                              # "embedded" (default) | "remote"
+url     = "http://memory.tailnet.local:7843"     # required when mode = "remote"
+api_key = "vault://secret/singularity-crush#sm_api_key"  # required when mode = "remote"
+# Embedded mode runs the singularity_memory_server engine in-process.
+# Remote mode shares the server across the fleet (Hermes, OpenClaw, sf, etc.).
+
 [worker]
 ssh_hosts                      = []
 max_concurrent_agents_per_host = 3
@@ -1535,13 +1542,24 @@ Score mappings: `over=0.3` (over-resourced), `ok=0.8`, `under=0.0` (blocks model
 
 ### 16.1 Architecture
 
-The knowledge layer is **Hindsight** ([vectorize-io/hindsight](https://github.com/vectorize-io/hindsight-cookbook)) — a memory service accessible on the tailnet. singularity-crush uses `hindsight-client-go`. There is no local vector store, no sqlite-vec table, no FTS5 fallback — all retrieval and persistence go through Hindsight.
+The knowledge layer is **Singularity Memory** (`sm`) — an HTTP + MCP server we own. The engine was derived from [`vectorize-io/hindsight`](https://github.com/vectorize-io/hindsight) (MIT) and assimilated into `singularity_memory_server/` under our namespace; from sf's perspective there is no upstream service. The same `sm` server is shared across our agent fleet (Hermes, OpenClaw, Claude Code, Cursor, sf), so memories accumulate across tools.
 
-SQLite in singularity-crush holds **orchestration state only** (sessions, units, blockers, gates, benchmarks, circuit breakers, agents). Memories, learnings, anti-patterns, and codebase context live in Hindsight.
+singularity-crush uses `singularity-memory-client-go`, generated from `singularity-memory/openapi.yaml`. There is no local vector store, no sqlite-vec table, no FTS5 fallback — all retrieval and persistence go through `sm`.
 
-When Hindsight is unreachable, the harness MUST log a warning and dispatch with no recall context. The agent still runs; it just lacks historical memory for that session. The harness MUST NOT block dispatch on Hindsight availability.
+**Embedded vs remote deployment.** sm supports both modes:
 
-**Retain failures queue locally.** PostUnit retain calls that fail (transport error, 5xx) MUST be enqueued in `pending_retain` and retried with exponential backoff on every poll tick until success. This means a unit's learnings are never silently lost to a Hindsight outage:
+| Mode | When | Config |
+|---|---|---|
+| **Embedded** (default for single-user sf) | sm engine runs in-process; no extra service to operate | `[memory] mode = "embedded"` |
+| **Remote** | sm runs as a tailnet service shared across multiple tools/users | `[memory] mode = "remote"`, `[memory] url = "http://memory.tailnet.local:7843"` |
+
+Embedded mode eliminates the network hop for the common case. Switching to remote shares context across the fleet at the cost of a network round-trip per recall.
+
+SQLite in singularity-crush holds **orchestration state only** (sessions, units, blockers, gates, benchmarks, circuit breakers, agents). Memories, learnings, anti-patterns, and codebase context live in Singularity Memory.
+
+When `sm` is unreachable, the harness MUST log a warning and dispatch with no recall context (plus the local `local_anti_patterns` mirror, § 3.1). The agent still runs; it just lacks historical memory for that session. The harness MUST NOT block dispatch on memory availability.
+
+**Retain failures queue locally.** PostUnit retain calls that fail (transport error, 5xx) MUST be enqueued in `pending_retain` and retried with exponential backoff on every poll tick until success. This means a unit's learnings are never silently lost to an `sm` outage:
 
 ```sql
 CREATE TABLE pending_retain (
@@ -1557,27 +1575,27 @@ CREATE TABLE pending_retain (
 
 `pending_retain` rows older than 7 days are flushed to `.sf/archive/lost-learnings.jsonl` and removed; at that point the operator is expected to investigate.
 
-### 16.1.1 Hindsight client interface
+### 16.1.1 Memory client interface
 
-The harness uses `hindsight-client-go` through a thin wrapper that the rest of the codebase depends on. This wrapper is the seam between SF and Hindsight; tests substitute a fake.
+The harness uses `singularity-memory-client-go` (auto-generated from `openapi.yaml`) through a thin wrapper that the rest of the codebase depends on. This wrapper is the seam between sf and Singularity Memory; tests substitute a fake.
 
 ```go
-type Hindsight interface {
+type Memory interface {
     // Recall fetches top-k entries from a bank for a query. opts.Filter
     // may include {"collection": "anti_patterns"} or other tags.
-    Recall(ctx context.Context, bank string, query string, opts RecallOpts) ([]Memory, error)
+    Recall(ctx context.Context, bank string, query string, opts RecallOpts) ([]Entry, error)
 
-    // Retain stores a new memory in a bank. document_id is required for
+    // Retain stores a new entry in a bank. document_id is required for
     // upsert-by-content-hash semantics (§ 16.3).
-    Retain(ctx context.Context, bank string, mem Memory) error
+    Retain(ctx context.Context, bank string, entry Entry) error
 
-    // Feedback signals helpfulness of a memory recalled in this dispatch.
+    // Feedback signals helpfulness of an entry recalled in this dispatch.
     // signal ∈ {-1, 0, +1}; +1 resets decay timer.
-    Feedback(ctx context.Context, memID string, signal int) error
+    Feedback(ctx context.Context, entryID string, signal int) error
 
-    // Validate marks the memory as still-relevant (resets decay timer).
-    // Called by PostUnit when a recalled memory directly contributed to success.
-    Validate(ctx context.Context, memID string) error
+    // Validate marks the entry as still-relevant (resets decay timer).
+    // Called by PostUnit when a recalled entry directly contributed to success.
+    Validate(ctx context.Context, entryID string) error
 
     // Health probe. Used by /sf doctor and the retain queue.
     Health(ctx context.Context) error
@@ -1589,7 +1607,7 @@ type RecallOpts struct {
     RerankQuality string                // "fast" | "accurate"
 }
 
-type Memory struct {
+type Entry struct {
     DocumentID string                   // content hash; upsert key
     Content    string
     Tags       []string
@@ -1599,10 +1617,10 @@ type Memory struct {
 ```
 
 The wrapper is responsible for:
-1. Translating SF's `last_error` and gate output into Memory.Content.
+1. Translating sf's `last_error` and gate output into `Entry.Content`.
 2. Adding `is_negative` and `collection` tags appropriately.
-3. Routing Hindsight transport errors through `pending_retain` (§ 16.1).
-4. Exposing the local `local_anti_patterns` mirror to `Recall` when Hindsight is unreachable.
+3. Routing transport errors through `pending_retain` (§ 16.1).
+4. Exposing the local `local_anti_patterns` mirror to `Recall` when `sm` is unreachable.
 
 ### 16.2 Memory tiers
 
@@ -1610,17 +1628,17 @@ Two tiers prevent token bloat during long-running sessions:
 
 **Hot cache** — current dispatch's recent turns held in memory (never persisted to SQLite). Configurable size: `[harness] hot_cache_turns = 10`. Cleared on compaction.
 
-**Hindsight store** — durable. PostUnit writes summaries, learnings, and anti-patterns. Pre-dispatch reads top-N most relevant entries. On compaction, the hot cache is summarised and written to Hindsight as a `session_summary` entry.
+**Singularity Memory store** — durable. PostUnit writes summaries, learnings, and anti-patterns. Pre-dispatch reads top-N most relevant entries. On compaction, the hot cache is summarised and written to Singularity Memory as a `session_summary` entry.
 
 The harness MUST NOT mix the two tiers.
 
 ### 16.3 Two-bank pattern
 
-Each session uses two Hindsight banks, queried separately and merged before each dispatch:
+Each session uses two Singularity Memory banks, queried separately and merged before each dispatch:
 
 ```go
-projectRecall := hindsight.Recall("project/"+projectHash, query)
-globalRecall  := hindsight.Recall("global/coding", query)
+projectRecall := sm.Recall("project/"+projectHash, query)
+globalRecall  := sm.Recall("global/coding", query)
 // merge, deduplicate, inject top-N into unit context
 ```
 
@@ -1630,7 +1648,7 @@ globalRecall  := hindsight.Recall("global/coding", query)
 2. If no git remote, `projectHash = sha256(absolute_path_with_real_user_home)[:16]`.
 3. The resolved hash is cached in `.sf/runtime/project-hash.json` to ensure stability if the remote changes (a cleared cache forces re-derivation; a project move under a different remote is a deliberate re-bank).
 
-This means a developer cloning the repo on a second machine hits the same Hindsight bank as their first machine. Different forks of the same project have different remotes and thus different banks — desired, because their context diverges.
+This means a developer cloning the repo on a second machine hits the same Singularity Memory bank as their first machine. Different forks of the same project have different remotes and thus different banks — desired, because their context diverges.
 
 Concurrent `retain` calls from parallel slice workers use `document_id` derived from content hash. Duplicate memories silently overwrite rather than accumulate.
 
@@ -1640,7 +1658,7 @@ Anti-patterns are memories tagged `collection: anti_patterns`, `is_negative: tru
 - Are written explicitly when the agent makes a mistake (gate failure or user feedback).
 - MUST NOT be subject to normal maturation decay — they persist at full weight until explicitly removed.
 - Are retrieved at dispatch time and presented in a dedicated block: `<anti_patterns>avoid these mistakes...</anti_patterns>`.
-- MUST also be mirrored to the local `local_anti_patterns` SQLite table (§ 3.1) on `retain`. When Hindsight is unreachable, the harness still injects local anti-patterns into prompt context. Anti-patterns are small, high-value, and never decay — making them the one knowledge category worth duplicating locally.
+- MUST also be mirrored to the local `local_anti_patterns` SQLite table (§ 3.1) on `retain`. When Singularity Memory is unreachable, the harness still injects local anti-patterns into prompt context. Anti-patterns are small, high-value, and never decay — making them the one knowledge category worth duplicating locally.
 
 ```go
 type AntiPattern struct {
@@ -1678,7 +1696,7 @@ Entries with 10+ accesses gain a 7-day buffer against decay. Calling `validate()
 
 ### 16.7 Retrieval pipeline
 
-Retrieval is delegated to Hindsight via `hindsight.Recall(bank, query, opts)`. Hindsight runs its own internal pipeline — fused semantic + lexical retrieval, optional reranking, and decay weighting — and returns ranked entries. The harness does not implement a retrieval pipeline of its own.
+Retrieval is delegated to Singularity Memory via `sm.Recall(bank, query, opts)`. Singularity Memory runs its own internal pipeline — fused semantic + lexical retrieval, optional reranking, and decay weighting — and returns ranked entries. The harness does not implement a retrieval pipeline of its own.
 
 Recall options the harness uses:
 
@@ -1689,7 +1707,7 @@ Recall options the harness uses:
 | `filter` | Tag filters (e.g. `collection=anti_patterns`) |
 | `rerank_quality` | `fast` (routine) or `accurate` (pre-dispatch context injection) |
 
-The harness applies its own maturity and anti-pattern weighting (§ 16.4, § 16.5) by tagging entries on retain and filtering / re-ordering on recall — Hindsight stores the metadata but does not interpret it.
+The harness applies its own maturity and anti-pattern weighting (§ 16.4, § 16.5) by tagging entries on retain and filtering / re-ordering on recall — Singularity Memory stores the metadata but does not interpret it.
 
 ### 16.8 `sf init`
 
@@ -1697,10 +1715,10 @@ Deep analysis is default, not opt-in:
 
 1. AST-level codebase scan (languages, structure, entry points, dependencies).
 2. Git history analysis (active areas, recent changes, contributors).
-3. Retain findings into `project/{hash}` Hindsight bank.
+3. Retain findings into the `project/{hash}` Singularity Memory bank.
 4. Establish `.sf/config.toml` with detected stack, workflow templates, model routing hints.
 
-`--quick` flag skips Hindsight indexing for throwaway sessions.
+`--quick` flag skips Singularity Memory indexing for throwaway sessions.
 
 ---
 
@@ -1954,7 +1972,7 @@ type Chapter struct {
 
 Chapters serve two purposes:
 1. **Context recovery** — on resume after a crash, the harness reconstructs "what the agent was doing and why" from the chapter log. The chapter summary is injected at the top of the restored context.
-2. **Hindsight recall** — completed chapters are stored as discrete memory units. Recall queries match against chapter intent.
+2. **Singularity Memory recall** — completed chapters are stored as discrete entries. Recall queries match against chapter intent.
 
 The agent MAY open a chapter explicitly via `chapter_open(name)`.
 
@@ -2309,7 +2327,7 @@ Run on-demand model benchmarks for all tiers against real task samples. Updates 
 Run health checks:
 - `HarnessConfig.Validate()`
 - Vault connectivity
-- Hindsight connectivity
+- Singularity Memory connectivity
 - SQLite schema version
 - Lock file state
 - Workflow template syntax
@@ -2399,7 +2417,7 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-08** `turn_input_required` configurable `soft` (inject non-interactive message) or `hard` (fail immediately); MUST NOT stall indefinitely.
 - [ ] **C-09** Context budget: `ShouldCompact()` triggers compaction before next turn; `AtHardLimit()` halts unit; budget state persisted to SQLite after every turn.
 - [ ] **C-10** Budget token accounting prefers absolute totals; prevents double-counting.
-- [ ] **C-11** Compaction: write session summary to Hindsight, clear hot cache, start next turn with fresh Hindsight recall.
+- [ ] **C-11** Compaction: write session summary to Singularity Memory, clear hot cache, start next turn with fresh recall.
 - [ ] **C-12** Supervisor goroutine: all 9 built-in checks; communicates only via pubsub; MUST NOT call `os.Exit`.
 - [ ] **C-13** Circuit breaker: 3 consecutive non-transient failures trips model; state persisted to SQLite; resets after 24h or `/sf reset-circuits`.
 - [ ] **C-14** `ModelUnavailable` → `SignalAbort` immediately (not after timeout).
@@ -2422,7 +2440,7 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-31** Structured log format: `key=value` pairs; required context fields per scope; truncate at 2KB.
 - [ ] **C-32** Log rotation: 10MB max, 5 files, single-line format, stderr handler removed when file logging active.
 - [ ] **C-33** Span-based trace to `~/.sf/trace.jsonl`; non-blocking buffered writer; MUST NOT drop spans.
-- [ ] **C-34** Intent chapters: open/close with intent summary; used for crash recovery context and Hindsight recall.
+- [ ] **C-34** Intent chapters: open/close with intent summary; used for crash recovery context and Singularity Memory recall.
 - [ ] **C-35** Typed error codes; matching on error strings PROHIBITED.
 - [ ] **C-36** Scheduler state intentionally in-memory; restart re-dispatches from fresh poll.
 - [ ] **C-37** Project CI runs `specs.check`: AST-based godoc enforcement on all exported identifiers in singularity-crush's own harness packages. (Not a user-project runtime gate.)
@@ -2434,12 +2452,12 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-43** Crash recovery: `running` units → `interrupted` on startup; re-dispatch fresh from last persisted phase boundary with `last_error = "resumed_after_crash"`; tool calls NOT replayed; agent sessions NOT resumed.
 - [ ] **C-44** Process lock at `~/.sf/run.lock`; stale-lock cleanup via `/proc` PID check.
 - [ ] **C-45** Doc-sync runs as a sub-step of `PhaseMerge` (not a separate phase, not a post-merge dispatch); empty diff is a no-op; user approval required unless `doc_sync_auto_approve = true`.
-- [ ] **C-46** SQLite is orchestration-only — no `memories` table, no vector index. Knowledge MUST live in Hindsight.
+- [ ] **C-46** SQLite is orchestration-only — no `memories` table, no vector index. Knowledge MUST live in Singularity Memory.
 - [ ] **C-47** Atomic claim acquisition: single conditional UPDATE pattern; rows_affected = 1 gates dispatch.
 - [ ] **C-48** `runs` table: CHECK constraint enforces XOR between unit_attempt and agent_run; aggregate token/cost are end-of-run rollup.
 - [ ] **C-49** `units.attempt` is current counter; historical attempts in `runs`; both updated in same transaction.
 - [ ] **C-50** Tracker `unknown` mid-run does NOT cancel in-flight attempts; only suppresses new dispatch. `blocked` mid-run also non-cancelling.
-- [ ] **C-51** Hindsight retain failures queue in `pending_retain`; flush to `lost-learnings.jsonl` after 7d.
+- [ ] **C-51** Singularity Memory retain failures queue in `pending_retain`; flush to `lost-learnings.jsonl` after 7d.
 - [ ] **C-52** Workflow selection priority: tracker label `sf:workflow=` → `default_workflow` config → built-in fallback. Pinned to unit at first dispatch; never re-evaluated.
 - [ ] **C-53** PhaseUAT trigger: workflow `require_uat = true`; halts auto-loop with `SignalPause`; resumes via `/sf uat-approve` or `/sf uat-reject`.
 - [ ] **C-54** Agent run termination conditions defined (inbox drain, stop tool, hard budget, turn cap, supervisor abort, timeout); hot cache NOT preserved across runs; durable blocks and message history ARE.
@@ -2475,23 +2493,26 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-84** Gate script protocol: env vars (SF_PROJECT_ROOT, SF_UNIT_ID, SF_RUN_ID, SF_PHASE, SF_ATTEMPT, SF_GATE_NAME, SF_GATE_RETRY, SF_WORKSPACE, SF_TRACE_FILE), stdin = UnitResult JSON, exit codes 0/1/2/3, output truncated at 8 KB.
 - [ ] **C-85** Gate retry counter is separate from `units.attempt`; resets on phase transition.
 - [ ] **C-86** `plan.md` frontmatter (unit_id, created_at, written_by, plan_version) + sections (Goal, Approach, Deliverables, Verification, Notes) validated before transition out of PhasePlan.
-- [ ] **C-87** `Hindsight` interface (Recall, Retain, Feedback, Validate, Health); `pending_retain` queue routes failed Retains; `local_anti_patterns` mirror exposed when Hindsight unreachable.
+- [ ] **C-87** `Memory` interface (Recall, Retain, Feedback, Validate, Health) generated from `singularity-memory/openapi.yaml`; `pending_retain` queue routes failed Retains; `local_anti_patterns` mirror exposed when sm unreachable.
 - [ ] **C-88** SF tools registered through Crush's `internal/agent/tools/`; PreToolUse hooks apply uniformly; auto_approve keys documented per tool.
 - [ ] **C-89** All operator commands referenced elsewhere in spec are present in § 25: reassess-resolve, force-clear, merge-resolve, uat-approve, uat-reject, agent {list,run,reset,delete,inspect,history}, history, clean.
 - [ ] **C-90** `agent_capabilities` index maintained in sync with `agents.capabilities`; capability lookup is index scan, not full table scan.
 - [ ] **C-91** Trace JSONL archive move is transactional with `trace_index.file_path` UPDATE; recoverable if interrupted.
 - [ ] **C-92** Versioning policy: SemVer; v1.0 freezes §§3, 4, 6, 10, 14, 26.
 - [ ] **C-93** [STRONG] Rate-limit data is observability-only; no orchestrator retry/dispatch logic reads it.
+- [ ] **C-94** Singularity Memory is the sole knowledge backend; engine assimilated into `singularity_memory_server/` (MIT-attributed, no upstream runtime dep).
+- [ ] **C-95** `[memory] mode = "embedded"` is the default for single-user sf; `mode = "remote"` MUST require `url` and `api_key` (vault://).
+- [ ] **C-96** Go client `singularity-memory-client-go` is generated from `singularity-memory/openapi.yaml`; sf imports it as a normal Go module dependency.
 
 ### 26.2 Knowledge layer (ship after core)
 
-- [ ] **K-01** Memory tiers: hot cache (in-memory, last 10 turns); Hindsight store (durable, PostUnit writes).
-- [ ] **K-02** Two-bank Hindsight pattern: `project/{hash}` + `global/coding`; merged before dispatch.
+- [ ] **K-01** Memory tiers: hot cache (in-memory, last 10 turns); Singularity Memory store (durable, PostUnit writes).
+- [ ] **K-02** Two-bank pattern in Singularity Memory: `project/{hash}` + `global/coding`; merged before dispatch.
 - [ ] **K-03** Anti-pattern library: `collection: anti_patterns`; never decay; surfaced in dedicated `<anti_patterns>` block.
 - [ ] **K-04** Pattern maturation: 4 states (candidate → established → proven → deprecated); weights as specified.
 - [ ] **K-05** Confidence decay: `halfLife = 90 * (0.5 + confidence)` days.
-- [ ] **K-06** Hindsight is the sole knowledge backend; on Hindsight outage, dispatch proceeds with empty recall and a logged warning.
-- [ ] **K-07** `sf init` deep analysis default; `--quick` skips Hindsight indexing.
+- [ ] **K-06** Singularity Memory is the sole knowledge backend; on sm outage, dispatch proceeds with empty recall (plus local_anti_patterns mirror) and a logged warning.
+- [ ] **K-07** `sf init` deep analysis default; `--quick` skips Singularity Memory indexing.
 
 ### 26.3 Model routing (ship after core)
 

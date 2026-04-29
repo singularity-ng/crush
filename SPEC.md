@@ -129,6 +129,7 @@ CREATE TABLE units (
     session_id   TEXT NOT NULL REFERENCES sessions(id),
     parent_id    TEXT REFERENCES units(id),  -- milestone has NULL parent; slice's parent is milestone; task's parent is slice
     type         TEXT NOT NULL,          -- milestone | slice | task
+    workflow     TEXT NOT NULL,          -- workflow template name; pinned at first dispatch
     phase        TEXT NOT NULL,
     phase_status TEXT NOT NULL,          -- pending | running | succeeded | failed | canceled | interrupted
     attempt      INTEGER NOT NULL DEFAULT 1,  -- 1 = first try, 2 = first retry, ...
@@ -155,8 +156,8 @@ CREATE TABLE phase_transitions (
 );
 
 CREATE TABLE task_blockers (
-    task_id      TEXT NOT NULL,
-    blocked_by   TEXT NOT NULL,          -- unit_id of upstream dependency
+    task_id      TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    blocked_by   TEXT NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     PRIMARY KEY (task_id, blocked_by)
 );
 
@@ -211,20 +212,31 @@ CREATE TABLE schema_migrations (
 
 CREATE TABLE runs (
     id           TEXT PRIMARY KEY,            -- ULID
-    run_kind     TEXT NOT NULL,               -- unit_attempt | agent_run
-    unit_id      TEXT REFERENCES units(id),   -- non-NULL when run_kind = unit_attempt
-    agent_id     TEXT REFERENCES agents(id),  -- non-NULL when run_kind = agent_run
+    run_kind     TEXT NOT NULL CHECK (run_kind IN ('unit_attempt', 'agent_run')),
+    unit_id      TEXT REFERENCES units(id) ON DELETE CASCADE,
+    agent_id     TEXT REFERENCES agents(id) ON DELETE CASCADE,
     attempt      INTEGER,                     -- only for unit_attempt
     worker_host  TEXT,
     workspace    TEXT,
     started_at   INTEGER NOT NULL,
     ended_at     INTEGER,
-    outcome      TEXT,                        -- success | failure | abandoned | canceled | timeout
-    error_code   TEXT,                        -- typed error from § 20.1, NULL on success
+    outcome      TEXT,                        -- success | failure | abandoned | canceled
+                                              --   | unit_timeout | turn_timeout | stalled
+    error_code   TEXT,                        -- typed error from § 20.1; stores the string
+                                              --   value of the const, e.g. "turn_timeout"
     input_tokens   INTEGER NOT NULL DEFAULT 0,
     output_tokens  INTEGER NOT NULL DEFAULT 0,
-    cost_usd       REAL NOT NULL DEFAULT 0
+    cost_usd       REAL NOT NULL DEFAULT 0,
+    CHECK (
+      (run_kind = 'unit_attempt'  AND unit_id  IS NOT NULL AND agent_id IS NULL    AND attempt IS NOT NULL)
+      OR
+      (run_kind = 'agent_run'     AND agent_id IS NOT NULL AND unit_id  IS NULL    AND attempt IS NULL)
+    )
 );
+
+-- Aggregate token/cost columns are an end-of-run rollup written once on ended_at.
+-- Span data in trace.jsonl (§ 19.3) is authoritative; runs columns are the cached
+-- summary used by /sf session-report and the HTTP API without re-scanning JSONL.
 
 -- Local mirror of selected Hindsight entries that the harness needs offline.
 -- Limited to anti-patterns by default — small, high-value, MUST surface even
@@ -339,7 +351,11 @@ The tracker MUST report each unit's status as one of:
 | `cancelled` | Closed-as-wontfix, deleted, archived | NO (terminal) |
 | `unknown` | Tracker returned a status the plugin couldn't classify | NO; logged as warning, treated as blocked |
 
-**Non-active** = anything except `active`. A unit becoming non-active mid-run triggers `ReconciliationCancel` (§ 9.2) and the attempt enters `AttemptCanceled`.
+**Non-active** = anything except `active`. A unit transitioning from `active` to `done` or `cancelled` mid-run triggers `ReconciliationCancel` (§ 9.2) and the attempt enters `AttemptCanceled`.
+
+**`unknown` mid-run is a transient signal and MUST NOT cancel an in-flight attempt.** It only suppresses *new* dispatches. The orchestrator continues monitoring; if a subsequent fetch resolves the status to `done`/`cancelled`, then ReconciliationCancel fires. This protects against flaky tracker APIs.
+
+**`blocked` mid-run** is similarly non-cancelling — the in-flight attempt continues. The blocker resurgence is logged.
 
 #### 3.3.3 Built-in trackers
 
@@ -391,7 +407,7 @@ const (
     PhaseMerge                 // commit, push, open PR
     PhaseComplete              // unit done; result recorded; artifact archived
     PhaseReassess              // re-enter planning with failure context
-    PhaseUAT                   // human acceptance; only when uat_dispatch = true
+    PhaseUAT                   // human acceptance; only when workflow has require_uat = true
 )
 ```
 
@@ -458,8 +474,17 @@ name            = "feature"
 phases          = ["research", "plan", "execute", "tdd", "verify", "review", "merge", "complete"]
 require_tdd     = true    # PhaseTDD is enforced; skipping is a gate violation
 require_review  = true
+require_uat     = false   # if true, PhaseUAT is inserted before PhaseComplete
 max_retries     = 3       # per gate in PhaseVerify
 max_reassess    = 2
+
+# .sf/workflows/release.toml — uses UAT
+name            = "release"
+phases          = ["research", "plan", "execute", "tdd", "verify", "review", "uat", "merge", "complete"]
+require_tdd     = true
+require_review  = true
+require_uat     = true    # halts after UAT enters; only resumes on /sf uat-approve
+max_retries     = 3
 
 # .sf/workflows/spike.toml
 name            = "spike"
@@ -469,7 +494,17 @@ require_review  = false
 max_retries     = 0
 ```
 
-The harness MUST fail startup if a configured workflow template references an unknown phase.
+PhaseUAT halts the auto-loop with `SignalPause` and waits for `/sf uat-approve <unit-id>` (advance to PhaseMerge) or `/sf uat-reject <unit-id> "reason"` (advance to PhaseReassess). The harness MUST fail startup if a configured workflow template references an unknown phase or includes `uat` without `require_uat = true`.
+
+#### Workflow selection at dispatch
+
+The workflow used for a given unit is determined in this order:
+
+1. Explicit unit metadata: tracker label `sf:workflow=<name>` (if set).
+2. Project default: `[harness] default_workflow = "feature"` in `.sf/config.toml`.
+3. Built-in fallback: `feature` (if available) else the first workflow in `.sf/workflows/`.
+
+The selected workflow is recorded in `units.workflow` at dispatch time and never re-evaluated for that unit, even on retry — workflow stability across attempts is a hard guarantee.
 
 ### 4.6 Phase transitions — implementation rules
 
@@ -532,6 +567,21 @@ A unit MUST NOT be dispatched if any of its upstream dependencies (in `task_bloc
 A dependency that failed and was marked abandoned is terminal and MUST NOT block downstream dispatch.
 
 Blocked units stay queued and are re-evaluated on the next poll tick. No backoff, no retry counter increment for a blocked wait.
+
+### 5.3.1 Atomic claim acquisition
+
+The orchestrator acquires a claim with a single conditional UPDATE:
+
+```sql
+UPDATE units
+   SET claim_holder = ?, claim_until = ?, phase_status = 'running', updated_at = ?
+ WHERE id = ?
+   AND (claim_holder IS NULL OR claim_until < ?);  -- ? = now()
+```
+
+Dispatch proceeds only if `rows_affected = 1`. This makes the claim race-free at the DB level and supports multiple orchestrators against the same `~/.sf/sf.db` even though SF normally runs as a singleton (one process per `~/.sf/run.lock`). The atomic claim is the safety net if the lock fails (e.g. shared NFS, broken filesystem semantics).
+
+`units.attempt` is the **current** attempt counter (used as the `attempt` prompt template variable). Historical attempts live in `runs` (§ 3.1). Authority: `units.attempt` is incremented exactly when a new `runs` row is inserted; the two are kept in sync inside the same transaction.
 
 ### 5.4 Per-phase concurrency
 
@@ -664,7 +714,9 @@ A `TurnContinuation` MUST receive a short guidance prompt, not the full task pro
 
 ### 7.3 Attempt variable semantics
 
-The `attempt` variable enables prompt templates to give different instructions to retrying agents vs. fresh starts. A retry prompt SHOULD include: `"your previous attempt failed with: {{last_error}} — focus on that specifically."` The harness injects `last_error` automatically on `attempt >= 1`.
+The `attempt` variable enables prompt templates to give different instructions to retrying agents vs. fresh starts. A retry prompt SHOULD include: `"your previous attempt failed with: {{last_error}} — focus on that specifically."` The harness injects `last_error` automatically on `attempt >= 2`.
+
+**`last_error` is only injected on `TurnFirst` of attempts ≥ 2.** Continuation turns within the same attempt have already established context and don't need it. A turn failure within an attempt always fails the entire attempt (§ 6); there are no mid-attempt error injections to reason about.
 
 ### 7.4 `turn_input_required` in auto-mode
 
@@ -1210,6 +1262,22 @@ SQLite in singularity-crush holds **orchestration state only** (sessions, units,
 
 When Hindsight is unreachable, the harness MUST log a warning and dispatch with no recall context. The agent still runs; it just lacks historical memory for that session. The harness MUST NOT block dispatch on Hindsight availability.
 
+**Retain failures queue locally.** PostUnit retain calls that fail (transport error, 5xx) MUST be enqueued in `pending_retain` and retried with exponential backoff on every poll tick until success. This means a unit's learnings are never silently lost to a Hindsight outage:
+
+```sql
+CREATE TABLE pending_retain (
+    id           TEXT PRIMARY KEY,         -- ULID
+    bank         TEXT NOT NULL,
+    payload      TEXT NOT NULL,            -- serialised retain request
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL,
+    last_error   TEXT,
+    created_at   INTEGER NOT NULL
+);
+```
+
+`pending_retain` rows older than 7 days are flushed to `.sf/archive/lost-learnings.jsonl` and removed; at that point the operator is expected to investigate.
+
 ### 16.2 Memory tiers
 
 Two tiers prevent token bloat during long-running sessions:
@@ -1362,7 +1430,20 @@ const (
 
 The harness owns all state transitions. The agent loop MUST NOT write `AgentState` directly.
 
-### 17.5 Agent fleet supervision
+### 17.5 Agent run termination
+
+A persistent agent run terminates when ANY of:
+
+1. **Inbox drained.** The agent's inbox has no `delivered = 0` rows AND the agent's last turn produced no outgoing `send_message` requiring `wait_for_reply`.
+2. **Explicit stop.** The agent calls a built-in `stop()` tool, signalling it has no further work.
+3. **Budget exhausted.** Per-agent `Budget.AtHardLimit()` fires (§ 8). Compaction does NOT terminate the run; only hard-limit does.
+4. **Turn cap.** `max_turns_per_run = 100` (configurable per-agent via `agents.max_turns_per_run` column or `[harness] agent_max_turns_per_run`). Higher than unit cap because agents are long-running.
+5. **Supervisor signal.** `SignalAbort` for any reason (StuckLoop, AbandonDetect, ReconciliationCancel does not apply to agents).
+6. **Timeout.** A configurable `agent_run_timeout = "30m"` from run start.
+
+On termination the agent transitions to `AgentIdle` (or `AgentStopped` for case 2). On wake (next inbox message), a NEW run begins — the **agent's hot cache is NOT preserved across runs**; only the durable memory blocks (`agent_memory_blocks`) and message history (`agent_messages`) survive.
+
+### 17.6 Agent fleet supervision
 
 Each persistent agent has its own `Budget` instance (§ 8) that persists across runs and is reset only on explicit `/sf agent reset <name>`. Compaction fires per-agent — when one agent's budget hits the compact threshold, only its hot cache is summarised; other agents are unaffected.
 
@@ -1809,9 +1890,11 @@ Four-phase git-aware revert protocol:
 
 After all reverts: restore `.sf/active/{unit-id}/` artifacts from archive; mark unit as `[ ]` in the plan.
 
-### `/sf rate over|ok|under`
+### `/sf rate over|ok|under [unit-id]`
 
-Signal model quality for the most recent unit. Writes to `benchmark_results` with human-rating weight multiplier.
+Signal model quality. Without `unit-id`, targets the most recently completed run in the current session — specifically the latest row in `runs` where `outcome IN ('success', 'failure')` and `ended_at IS NOT NULL`, scoped to `session_id`. With `unit-id`, targets the latest run for that unit.
+
+Writes to `benchmark_results` with the human-rating weight multiplier (default 3×). Cannot be issued against an in-flight run.
 
 ### `/sf benchmark`
 
@@ -1894,6 +1977,15 @@ Use this checklist as the definition-of-done for each build phase. An implementa
 - [ ] **C-44** Process lock at `~/.sf/run.lock`; stale-lock cleanup via `/proc` PID check.
 - [ ] **C-45** Doc-sync runs as a sub-step of `PhaseMerge` (not a separate phase, not a post-merge dispatch); empty diff is a no-op; user approval required unless `doc_sync_auto_approve = true`.
 - [ ] **C-46** SQLite is orchestration-only — no `memories` table, no vector index. Knowledge MUST live in Hindsight.
+- [ ] **C-47** Atomic claim acquisition: single conditional UPDATE pattern; rows_affected = 1 gates dispatch.
+- [ ] **C-48** `runs` table: CHECK constraint enforces XOR between unit_attempt and agent_run; aggregate token/cost are end-of-run rollup.
+- [ ] **C-49** `units.attempt` is current counter; historical attempts in `runs`; both updated in same transaction.
+- [ ] **C-50** Tracker `unknown` mid-run does NOT cancel in-flight attempts; only suppresses new dispatch. `blocked` mid-run also non-cancelling.
+- [ ] **C-51** Hindsight retain failures queue in `pending_retain`; flush to `lost-learnings.jsonl` after 7d.
+- [ ] **C-52** Workflow selection priority: tracker label `sf:workflow=` → `default_workflow` config → built-in fallback. Pinned to unit at first dispatch; never re-evaluated.
+- [ ] **C-53** PhaseUAT trigger: workflow `require_uat = true`; halts auto-loop with `SignalPause`; resumes via `/sf uat-approve` or `/sf uat-reject`.
+- [ ] **C-54** Agent run termination conditions defined (inbox drain, stop tool, hard budget, turn cap, supervisor abort, timeout); hot cache NOT preserved across runs; durable blocks and message history ARE.
+- [ ] **C-55** `last_error` injected only on `TurnFirst` of `attempt >= 2`.
 
 ### 26.2 Knowledge layer (ship after core)
 

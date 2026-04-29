@@ -45,7 +45,7 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **
 
 singularity-crush is an autopilot layer built on top of [charmbracelet/crush](https://github.com/charmbracelet/crush). Crush is an interactive coding agent — a human drives it turn by turn. singularity-crush adds a harness that drives Crush autonomously through a structured phase sequence (research → plan → execute → verify → complete) without human intervention per unit, while the human watches or steers.
 
-singularity-crush is a fork of Crush. It MUST NOT rebuild what Crush already provides:
+singularity-crush is a **fork** of Crush, distributed as a single binary named `sf`. It re-uses Crush's `internal/` packages directly (same Go module, vendored crush as a subdirectory). The TUI's slash-command router is extended with the `/sf <subcommand>` namespace (§ 25); existing Crush slash commands (`/help`, `/clear`, etc.) continue to work unchanged. This means an `sf` user can drive interactively like vanilla Crush, then opt into autopilot via `/sf auto`. It MUST NOT rebuild what Crush already provides:
 
 - Agent loop via `charm.land/fantasy`
 - Multi-provider LLM (Anthropic, OpenAI, Gemini, Groq, Bedrock, Azure, Ollama) via `charm.land/catwalk`
@@ -81,7 +81,9 @@ The slug encodes the parent hierarchy redundantly with `units.parent_id` to make
 
 **Turn** — one model call within an attempt. An attempt consists of one or more turns. The first turn receives the full task prompt; subsequent turns receive continuation guidance only.
 
-**Session** — a top-level container with a stable ID, persisting across process restarts. The session holds the running state for all units, the context budget, and the supervisor state.
+**Project** — a directory with `.sf/config.toml`. The project root is the directory containing `.sf/`. Each project has its own SQLite DB at `<project>/.sf/sf.db` — `~/.sf/sf.db` is the cross-project default DB used only when no project-local DB exists. Multiple projects on the same machine MUST use separate `.sf/` directories and therefore separate DBs, locks, and trace files.
+
+**Session** — a top-level container scoped to one project, with a stable ULID, persisting across process restarts of the same project. A session is created on the first `/sf auto` or `/sf next` invocation in a project and reused on subsequent invocations until explicitly ended (`/sf session end`) or until 30 days of inactivity. The session holds the running state for all units, the context budget, and the supervisor state.
 
 **Harness** — the layer between the agent loop (fantasy) and SF's orchestration logic (milestones, phases, git, worktrees). It owns: context budget, phase transitions, unit lifecycle hooks, session contract, observability, and supervision. Nothing in the planning or git layers MUST reach past the harness boundary into fantasy directly.
 
@@ -105,7 +107,9 @@ The slug encodes the parent hierarchy redundantly with `units.parent_id` to make
 
 ## 3. Data Model
 
-The orchestrator uses a single SQLite database (`~/.sf/sf.db`) for **orchestration state only**: sessions, units, phase transitions, blockers, gate results, benchmarks, circuit breakers, and persistent agents. **Knowledge** (memories, learnings, anti-patterns, codebase context) lives in Hindsight (§ 16), not SQLite.
+The orchestrator uses a single SQLite database **per project** at `<project>/.sf/sf.db` (or `~/.sf/sf.db` for non-project sessions) for **orchestration state only**: sessions, units, phase transitions, blockers, gate results, benchmarks, circuit breakers, and persistent agents. **Knowledge** (memories, learnings, anti-patterns, codebase context) lives in Hindsight (§ 16), not SQLite.
+
+All primary keys for runtime-allocated rows (sessions, units, runs, agents, agent_messages, agent_inbox, gate_results, session_blockers, pending_retain) MUST be [ULIDs](https://github.com/ulid/spec) — sortable by creation time without a separate timestamp column. Schema-natural keys (model name, agent name) remain TEXT but are not ULIDs.
 
 The schema MUST be managed via sqlc and MUST use WAL mode:
 
@@ -125,26 +129,32 @@ CREATE TABLE sessions (
 );
 
 CREATE TABLE units (
-    id           TEXT PRIMARY KEY,
+    id           TEXT PRIMARY KEY,                    -- format: type/m{n}[/s{n}[/t{n}]]
     session_id   TEXT NOT NULL REFERENCES sessions(id),
-    parent_id    TEXT REFERENCES units(id),  -- milestone has NULL parent; slice's parent is milestone; task's parent is slice
-    type         TEXT NOT NULL,          -- milestone | slice | task
-    workflow     TEXT NOT NULL,          -- workflow template name; pinned at first dispatch
+    parent_id    TEXT REFERENCES units(id),           -- NULL for milestone; ≤ 3 levels deep
+    type         TEXT NOT NULL CHECK (type IN ('milestone', 'slice', 'task')),
+    workflow     TEXT NOT NULL,                       -- workflow template name; pinned at first dispatch
     phase        TEXT NOT NULL,
-    phase_status TEXT NOT NULL,          -- pending | running | succeeded | failed | canceled | interrupted
-    attempt      INTEGER NOT NULL DEFAULT 1,  -- 1 = first try, 2 = first retry, ...
-    claim_holder TEXT,                   -- worker host/PID currently dispatching this unit; NULL = unclaimed
-    claim_until  INTEGER,                -- UNIX ms; claim auto-expires at this time
-    priority     INTEGER,                -- 1 (urgent) .. 4 (low); NULL sorts last
-    tracker_kind TEXT,                   -- linear | github | jira | sqlite; matches tracker registry
-    tracker_id   TEXT,                   -- external ID in the tracker (issue ID, ticket key, etc.)
+    phase_status TEXT NOT NULL CHECK (phase_status IN
+                   ('pending', 'running', 'succeeded', 'failed', 'canceled', 'interrupted')),
+    attempt      INTEGER NOT NULL DEFAULT 1,          -- 1 = first try, 2 = first retry, ...
+    claim_holder TEXT,                                -- format: "{host}#{pid}" or "ssh:{host}#{pid}"
+    claim_until  INTEGER,                             -- UNIX ms; claim auto-expires at this time
+    priority     INTEGER,                             -- 1 (urgent) .. 4 (low); NULL sorts last
+    tracker_kind TEXT,                                -- matches tracker registry
+    tracker_id   TEXT,                                -- external ID in the tracker
     title        TEXT NOT NULL,
     description  TEXT,
-    worker_host  TEXT,                   -- NULL = local; binary = SSH host
-    workspace    TEXT,
+    worker_host  TEXT,                                -- "local" | SSH host name; current/last worker
+    workspace    TEXT,                                -- path of latest workspace (current attempt)
+    archived_at  INTEGER,                             -- soft-delete; non-NULL = archived/forgotten
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
 );
+
+-- Hierarchy depth is enforced in code (the harness rejects parent_id pointing to a task).
+-- It would also be enforceable via a recursive trigger, but that adds write-path overhead
+-- for a constraint that the planning layer already validates.
 
 CREATE TABLE phase_transitions (
     id           TEXT PRIMARY KEY,
@@ -213,11 +223,13 @@ CREATE TABLE schema_migrations (
 CREATE TABLE runs (
     id           TEXT PRIMARY KEY,            -- ULID
     run_kind     TEXT NOT NULL CHECK (run_kind IN ('unit_attempt', 'agent_run')),
-    unit_id      TEXT REFERENCES units(id) ON DELETE CASCADE,
-    agent_id     TEXT REFERENCES agents(id) ON DELETE CASCADE,
+    unit_id      TEXT REFERENCES units(id)  ON DELETE SET NULL,   -- preserve forensics
+    agent_id     TEXT REFERENCES agents(id) ON DELETE SET NULL,   -- preserve forensics
+    unit_id_snap TEXT,                                             -- ID at run start; survives delete
+    agent_name_snap TEXT,                                          -- name at run start; survives delete
     attempt      INTEGER,                     -- only for unit_attempt
     worker_host  TEXT,
-    workspace    TEXT,
+    workspace    TEXT,                        -- workspace AT THIS attempt; authoritative for this run
     started_at   INTEGER NOT NULL,
     ended_at     INTEGER,
     outcome      TEXT,                        -- success | failure | abandoned | canceled
@@ -228,15 +240,19 @@ CREATE TABLE runs (
     output_tokens  INTEGER NOT NULL DEFAULT 0,
     cost_usd       REAL NOT NULL DEFAULT 0,
     CHECK (
-      (run_kind = 'unit_attempt'  AND unit_id  IS NOT NULL AND agent_id IS NULL    AND attempt IS NOT NULL)
+      (run_kind = 'unit_attempt'  AND unit_id_snap  IS NOT NULL AND agent_name_snap IS NULL AND attempt IS NOT NULL)
       OR
-      (run_kind = 'agent_run'     AND agent_id IS NOT NULL AND unit_id  IS NULL    AND attempt IS NULL)
+      (run_kind = 'agent_run'     AND agent_name_snap IS NOT NULL AND unit_id_snap IS NULL AND attempt IS NULL)
     )
 );
 
 -- Aggregate token/cost columns are an end-of-run rollup written once on ended_at.
 -- Span data in trace.jsonl (§ 19.3) is authoritative; runs columns are the cached
 -- summary used by /sf session-report and the HTTP API without re-scanning JSONL.
+--
+-- Soft-delete model: units and agents are NEVER hard-deleted by the harness — only
+-- marked archived (units.archived_at, agents.archived_at). The snap_ columns ensure
+-- run history survives even if a future operator manually drops rows.
 
 -- Local mirror of selected Hindsight entries that the harness needs offline.
 -- Limited to anti-patterns by default — small, high-value, MUST surface even
@@ -261,7 +277,10 @@ CREATE TABLE agents (
     name         TEXT NOT NULL UNIQUE,
     system       TEXT NOT NULL,          -- system prompt template
     model        TEXT NOT NULL,
-    state        TEXT NOT NULL DEFAULT 'idle', -- idle | running | waiting | stopped
+    state        TEXT NOT NULL DEFAULT 'idle' CHECK (state IN ('idle','running','waiting','stopped')),
+    capabilities TEXT,                   -- JSON array of capability tags (e.g. ["go","testing"])
+    max_turns_per_run INTEGER NOT NULL DEFAULT 100,
+    archived_at  INTEGER,                -- soft-delete; non-NULL = archived
     created_at   INTEGER NOT NULL,
     last_active  INTEGER
 );
@@ -506,18 +525,37 @@ The workflow used for a given unit is determined in this order:
 
 The selected workflow is recorded in `units.workflow` at dispatch time and never re-evaluated for that unit, even on retry — workflow stability across attempts is a hard guarantee.
 
-### 4.6 Phase transitions — implementation rules
+### 4.6 PhaseReassess
+
+`PhaseReassess` is entered when a unit cannot make progress through normal phases (gate failed `max_retries` times, merge conflict, supervisor halt). The Reassess agent is dispatched at the **`reasoning`** tier with `Think: true` and is given:
+
+- The original task description.
+- The full failure trail: gate output, last `max_retries` attempt errors, last commit history.
+- The unit's plan (from `.sf/active/{unit-id}/plan.md`).
+
+The Reassess agent MUST output one of:
+
+| Outcome | Effect |
+|---|---|
+| **Re-plan** | Writes a new `plan.md`, transitions back to `PhasePlan`. Counter `max_reassess` decrements. |
+| **Abandon** | Writes a `decision.md` explaining why the task cannot succeed; transitions to `PhaseComplete` with verdict `abandoned`. The tracker is updated with the abandonment reason. |
+| **Escalate** | Halts auto-loop with `SignalPause`; writes a `human-question.md` with concrete questions for the operator. Resumes on `/sf reassess-resolve <unit-id>`. |
+
+If `max_reassess` hits zero on a Re-plan path, the next entry into PhaseReassess MUST be Abandon or Escalate; Re-plan is rejected.
+
+### 4.7 Phase transition rules
 
 1. All phase transitions MUST go through a single `Harness.Transition(ctx, from, to, reason)` method.
-2. `Transition` MUST persist the `PhaseTransition` record to SQLite BEFORE the new phase begins. A crash mid-phase means on resume the harness re-enters the last committed phase cleanly (see § 4.7).
+2. `Transition` MUST persist the `PhaseTransition` record to SQLite BEFORE the new phase begins. A crash mid-phase means on resume the harness re-enters the last committed phase cleanly (see § 4.8).
 3. `Transition` MUST emit a pubsub `PhaseChange` event after the SQLite write. The TUI subscribes — it MUST NOT poll phase state directly.
-4. The harness MUST set `Think: true` on the model config for `Research` and `Plan` phases. The agent does not control this.
+4. The harness MUST set `Think: true` on the model config for `Research`, `Plan`, and `Reassess` phases. The agent does not control this.
+5. **`PhaseChange` is non-vetoable.** Hook subscribers receive a notification *after* the transition is committed; they cannot block or reject. Hooks that need veto semantics MUST register on `PreDispatch` instead, which fires before the next dispatch and IS vetoable.
 
-### 4.7 Crash recovery
+### 4.8 Crash recovery
 
 In-memory scheduler state is intentionally not persisted (§ 20.2). On restart, the orchestrator MUST follow this exact sequence:
 
-1. **Acquire process lock** at `~/.sf/run.lock` (PID file). Stale lock (PID not in `/proc`) is cleaned and logged.
+1. **Acquire project lock** at `<project>/.sf/run.lock` (PID file). Stale lock (PID not in `/proc` on Linux, `kill(pid, 0)` on other Unixes) is cleaned and logged. The lock is per-project; multiple projects can run auto concurrently on the same machine.
 2. **Mark interrupted units.** All units with `phase_status = 'running'` are updated to `phase_status = 'interrupted'`. This is the only schema-level recovery action.
 3. **Run startup cleanup** (§ 5.6) — move stale active artifacts to archive.
 4. **Resume from the last committed phase boundary.** Each `interrupted` unit is treated as eligible for fresh dispatch; the worker re-enters at `unit.phase` with a new attempt number (`unit.attempt + 1`). The agent receives a `last_error` of `"resumed_after_crash"` so the prompt can warn the agent.
@@ -769,6 +807,13 @@ When compaction fires (budget at compact threshold):
 
 Compaction MUST NOT truncate the window — it MUST replace it with a fresh recall. A truncated window loses structure; a recalled window gains relevance.
 
+**Agent run compaction preserves the wake context.** For persistent agent runs, the compacted window MUST include verbatim:
+- The wake message that started this run.
+- The most recent 3 inbox arrivals delivered in this run.
+- The agent's full `agent_memory_blocks` (these are durable anyway, but they go above the recall block).
+
+Compaction without this preservation can drop the originating intent and cause the agent to lose thread continuity mid-run.
+
 ### 8.4 Token accounting precision
 
 Provider responses arrive as either absolute thread totals or per-turn deltas. The harness MUST prefer absolute totals (`thread/tokenUsage/updated`-style events) and MUST track the last-reported total to compute deltas, preventing double-counting.
@@ -904,7 +949,19 @@ The payload is serialized to JSON and passed to hook subprocesses via stdin.
 
 - PostUnit hooks run **sequentially**, not concurrently. The next dispatch MUST NOT begin until all PostUnit hooks have returned.
 - A hook subprocess that exits non-zero for `PreDispatch` or `PostUnit` MUST trigger `SignalAbort`. The harness stops the session and marks it `SessionFailed`.
-- A hook that times out (default 60s, configurable via `[harness.hooks] timeout_ms`) is killed and logged. A `PostUnit` hook timeout MUST NOT block the next dispatch.
+- Hook timeouts are per-hook-type. Defaults:
+
+  | Hook | Default | Rationale |
+  |---|---|---|
+  | `before_run` | `120s` | Cleanup, dependency install can take time |
+  | `after_run` | `30s`  | Best-effort teardown |
+  | `after_create` | `120s` | First-time setup |
+  | `before_remove` | `30s` | Cleanup |
+  | `pre_dispatch` | `15s` | Should be a fast check |
+  | `post_unit` | `60s` | Subprocess work; longer for git push |
+  | `doc_sync` (built-in) | `5m` | Runs an agent dispatch over the diff |
+
+  All overridable in config via `[harness.hooks.timeouts.<hook_name>] = "<duration>"`. A timeout kills the hook and logs. A `PostUnit` hook timeout MUST NOT block the next dispatch.
 - The git service subscribes to PostUnit via a hook and handles commits, branch creation, and push. The harness MUST NOT call `git` directly.
 - Hindsight feedback (retain learnings, mark anti-patterns) is emitted from a built-in PostUnit hook (not a subprocess) — it calls the Hindsight client directly.
 - PostUnit hook results MUST be written to the trace as child spans of the unit span.
@@ -930,9 +987,14 @@ For successful calls: `success = true`, `output` = result summary. For unsupport
 
 If the agent calls a tool that is not registered, the harness MUST return a structured failure response and continue the session. It MUST NOT stall, panic, or exit on an unknown tool name.
 
-### 10.5 Doc sync (sub-step of PhaseMerge)
+### 10.5 Doc sync (sub-step of PhaseMerge or PhaseComplete)
 
-Doc sync runs as the final sub-step of `PhaseMerge`, before transitioning to `PhaseComplete`. It is not a separate phase and not a post-merge hook; it is part of the Merge phase's contract.
+Doc sync runs as the final sub-step of the **last code-mutating phase** before `PhaseComplete`:
+
+- For workflows that include `PhaseMerge`: doc sync runs at end of `PhaseMerge`.
+- For workflows that omit `PhaseMerge` but include `PhaseExecute` (e.g. `spike`): doc sync runs at end of the last code-mutating phase that ran. If the spike adopted a new dependency, doc sync still gets a chance to update `STACK.md`.
+
+It is not a separate phase and not a post-merge hook; it is the final sub-step of whichever phase was last to mutate code.
 
 The doc-sync sub-step:
 
@@ -1042,6 +1104,16 @@ worktree_mode = "branch-per-slice"   # or "milestone-per-worktree"
 - The harness MUST emit `WorktreeCreate` and `WorktreeDelete` events. It MUST NOT call `git` directly.
 - `worktree_mode` is session-immutable — changing it requires restart.
 
+### 12.3 Merge ordering for parallel slices
+
+When multiple slices in `branch-per-slice` mode complete concurrently, the harness MUST merge them in **dependency-aware** order, not completion order:
+
+1. A slice marked `code_depends_on: ["m1/s2"]` in unit metadata is held until that upstream slice's branch has merged.
+2. With no declared code dependency, slices merge in `created_at` order.
+3. The merge gate is serial: only one slice's merge runs at a time per project, even if multiple are eligible.
+
+This is distinct from `task_blockers` (task-completion dependency). **Code dependency** means slice B's diff cannot merge cleanly before slice A's diff. Without explicit declaration, the harness assumes no code dependency and merges in creation order — accept that this can produce avoidable conflicts that the next attempt will resolve.
+
 ---
 
 ## 13. Verification Gates
@@ -1078,9 +1150,15 @@ type GateResult struct {
 
 ### 13.3 PhaseReview — chunked review
 
-Large diffs MUST NOT be reviewed in a single pass. The harness MUST split the changed file list into chunks of ≤ 300 lines (`ReviewChunkLines = 300`) before dispatching the review agent. Each chunk is reviewed independently; findings are accumulated. The final synthesis pass reviews all findings across chunks.
+Large diffs MUST NOT be reviewed in a single pass. The harness MUST split the changed file list into chunks of ≤ 300 lines (`ReviewChunkLines = 300`) before dispatching the review agent. Files larger than `ReviewChunkLines` get their own chunk.
 
-Files larger than `ReviewChunkLines` get their own chunk.
+To prevent context-blind review of cross-file changes, the harness runs three passes:
+
+1. **Establish-context pass (single dispatch, fast tier).** The agent receives the full diff summary (file list + first/last 20 lines of each) and produces a one-paragraph "what this change does and what to watch for" summary.
+2. **Per-chunk review pass (parallel, `standard` tier).** Each chunk receives: the establish-context summary as a system-prompt prefix, then its own files. Reviewer findings are accumulated. Parallelism is bounded by `max_agents_by_phase.review`.
+3. **Synthesis pass (single dispatch, `standard` tier).** All chunk findings are merged, deduplicated, and prioritised. The synthesis agent decides whether the review should pass, request changes, or block (security/correctness issue).
+
+The synthesis verdict is what the harness acts on — chunked passes alone never decide.
 
 ### 13.4 Unit archive
 
@@ -1208,6 +1286,44 @@ Changing session-immutable fields requires restart.
 ### 14.4 Startup validation
 
 The harness MUST validate config at startup and MUST fail fast with a descriptive error on invalid config. It MUST NOT silently ignore unknown keys or bad values. `/sf doctor` MUST run `HarnessConfig.Validate()` as one of its checks.
+
+### 14.5 Project directory layout
+
+Every project has a `.sf/` directory with this canonical layout:
+
+```
+<project>/
+├── .sf/
+│   ├── config.toml             # project config (§ 14.1)
+│   ├── workflows/              # workflow templates (§ 4.5)
+│   │   ├── feature.toml
+│   │   └── spike.toml
+│   ├── hooks/                  # hook scripts referenced by config
+│   ├── gates/                  # gate scripts referenced by config
+│   ├── sf.db                   # SQLite orchestration DB
+│   ├── run.lock                # process lock (§ 4.7)
+│   ├── auto.lock               # signals auto-mode active (§ 4.7)
+│   ├── active/                 # in-progress unit artifacts
+│   │   └── {unit-id}/          # one directory per active unit
+│   │       ├── plan.md         # unit's plan/notes
+│   │       ├── workspace -> /path  # symlink to actual workspace
+│   │       └── run-{run-id}.log    # per-run log
+│   ├── archive/                # completed work + age-rolled artifacts
+│   │   ├── {YYYY-MM-DD}-{unit-id}/  # one per completed unit
+│   │   ├── agents/             # rolled agent_inbox/messages
+│   │   └── lost-learnings.jsonl    # pending_retain ages out here (§ 16.1)
+│   ├── log/
+│   │   └── sf.log              # rolling structured log (§ 19.2)
+│   ├── runtime/
+│   │   ├── paused-session.json # written when SessionPaused
+│   │   ├── gate-state.json     # last gate result per unit
+│   │   └── server.port         # actual HTTP API port (§ 14.2)
+│   └── trace/
+│       ├── trace-{YYYY-MM-DD}.jsonl  # daily-rotated spans
+│       └── _meta.json          # trace schema version, file index
+```
+
+Layout is stable: `/sf revert`, `/sf history`, archive sweeps, and the HTTP API all assume these exact paths.
 
 ---
 
@@ -1697,7 +1813,15 @@ Every deployment MUST document its trust posture explicitly. There is no univers
 
 ### 21.3 Auto-approval contract
 
-In auto-mode the harness calls `permission.AutoApproveSession()` ONLY for operations listed in `[harness.auto_approve]`. Sensitive operations (`fs:write-outside-project`, `shell:exec`) MUST always prompt regardless of auto-mode setting.
+In auto-mode the harness calls Crush's existing `permission.AutoApproveSession()` ONLY for operations listed in `[harness.auto_approve]`. Sensitive operations (`fs:write-outside-project`, `shell:exec`) MUST always prompt regardless of auto-mode setting.
+
+**Precedence between PreToolUse hooks and auto-approve.** Crush's PreToolUse hook system already runs before any tool call. If a PreToolUse hook returns `deny` or `halt`, the tool call is rejected even if `auto_approve` lists the tool. The order is:
+
+1. PreToolUse hooks run first; their decision is final for `deny`/`halt`.
+2. If hooks return `allow` or no decision, the auto-approve list is consulted.
+3. If neither approves, the user is prompted (interactive mode) or the call fails (auto-mode for non-allowlisted tools).
+
+This means: PreToolUse hooks MAY revoke an auto-approval; the auto-approve list MAY NOT override a hook denial. This precedence is critical for security policies that need to override per-session approvals.
 
 SF-specific permission gates:
 - `git:write` — any git operation that mutates state. Requires explicit grant in auto-mode.
@@ -1728,6 +1852,17 @@ max_concurrent_agents_per_host = 3
 - Once a run has produced side effects, moving to another host on retry is treated as a new attempt (not invisible failover).
 - The run record MUST include `worker_host` so operators can see where each run executed.
 - SSH workspace creation MUST use the same symlink-aware validation as local workspaces, implemented via shell script.
+
+### 22.3 Disconnect and zombie handling
+
+When the SSH connection drops mid-turn:
+
+1. The orchestrator marks the attempt `failed` with `error_code = "ssh_disconnected"` after `[worker] ssh_disconnect_timeout = "30s"` of no stdio activity.
+2. **Before** scheduling a retry, the orchestrator MUST emit a remote-cleanup script over a fresh SSH session: `pgrep -f "<workspace_marker>" | xargs -r kill -TERM`, wait 10s, then `kill -KILL`. The marker is a unique string injected into the agent process's command line (e.g. `--sf-run-id=<run_id>`).
+3. If the cleanup script fails (host unreachable), the host is marked `unhealthy` for `[worker] host_quarantine = "5m"`. New dispatches skip it; the host re-eligibility check runs each tick.
+4. The retry MUST land on a different host if `host_quarantine` is in effect for the original host; otherwise same host with a fresh workspace re-creation (the previous workspace is moved to `~/.sf/orphaned-workspaces/{timestamp}-{run-id}/` for forensics, not deleted).
+
+Zombies are the dominant failure mode for distributed execution; ignoring them produces double-write corruption.
 
 ---
 
@@ -1986,6 +2121,19 @@ Use this checklist as the definition-of-done for each build phase. An implementa
 - [ ] **C-53** PhaseUAT trigger: workflow `require_uat = true`; halts auto-loop with `SignalPause`; resumes via `/sf uat-approve` or `/sf uat-reject`.
 - [ ] **C-54** Agent run termination conditions defined (inbox drain, stop tool, hard budget, turn cap, supervisor abort, timeout); hot cache NOT preserved across runs; durable blocks and message history ARE.
 - [ ] **C-55** `last_error` injected only on `TurnFirst` of `attempt >= 2`.
+- [ ] **C-56** Per-project lock at `<project>/.sf/run.lock`; multiple projects can run auto concurrently.
+- [ ] **C-57** Project DB at `<project>/.sf/sf.db`; canonical directory layout (§ 14.5) MUST be honoured for `/sf revert`, `/sf history`, archive sweeps.
+- [ ] **C-58** All runtime ULID PKs; soft-delete via `archived_at` for units and agents (no cascade delete of runs).
+- [ ] **C-59** `runs` snap_ columns survive entity deletion; FK uses `ON DELETE SET NULL`.
+- [ ] **C-60** Per-hook-type timeouts (table in § 10.3); not a single global value.
+- [ ] **C-61** PhaseReassess outcomes: Re-plan / Abandon / Escalate; `max_reassess` decrements only on Re-plan; reasoning tier with Think.
+- [ ] **C-62** PhaseChange is non-vetoable; veto semantics live on PreDispatch.
+- [ ] **C-63** PhaseReview three-pass: establish-context → parallel chunked review → synthesis.
+- [ ] **C-64** SSH disconnect: `error_code = "ssh_disconnected"`; remote zombie cleanup via marker pgrep; host quarantine on cleanup failure; orphaned workspace preserved for forensics.
+- [ ] **C-65** Agent compaction preserves wake message + recent 3 inbox arrivals + full memory blocks.
+- [ ] **C-66** PreToolUse hook decisions outrank auto_approve list (deny wins; allow falls through to auto-approve).
+- [ ] **C-67** Slice merge ordering: `code_depends_on` honoured; merges serialised per project.
+- [ ] **C-68** Doc-sync sub-step runs at end of last code-mutating phase (Merge if present, else Execute).
 
 ### 26.2 Knowledge layer (ship after core)
 

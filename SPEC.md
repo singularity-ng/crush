@@ -45,7 +45,17 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **
 
 singularity-crush is an autopilot layer built on top of [charmbracelet/crush](https://github.com/charmbracelet/crush). Crush is an interactive coding agent — a human drives it turn by turn. singularity-crush adds a harness that drives Crush autonomously through a structured phase sequence (research → plan → execute → verify → complete) without human intervention per unit, while the human watches or steers.
 
-singularity-crush is a **fork** of Crush, distributed as a single binary named `sf`. It re-uses Crush's `internal/` packages directly (same Go module, vendored crush as a subdirectory). The TUI's slash-command router is extended with the `/sf <subcommand>` namespace (§ 25); existing Crush slash commands (`/help`, `/clear`, etc.) continue to work unchanged. This means an `sf` user can drive interactively like vanilla Crush, then opt into autopilot via `/sf auto`. It MUST NOT rebuild what Crush already provides:
+singularity-crush is a **fork** of Crush, distributed as a single binary named `sf`. It re-uses Crush's `internal/` packages directly. Go's `internal/` visibility rule means only code in the same module tree may import `internal/...` — the fork model satisfies this constraint cleanly: singularity-crush's `harness/`, `tracker/`, etc. live alongside Crush's `internal/` in the same module (`github.com/singularity-ng/crush`). Vendoring or external imports would not work. The TUI's slash-command router is extended with the `/sf <subcommand>` namespace (§ 25); existing Crush slash commands (`/help`, `/clear`, etc.) continue to work unchanged. This means an `sf` user can drive interactively like vanilla Crush, then opt into autopilot via `/sf auto`.
+
+### 1.1 Versioning
+
+singularity-crush follows [SemVer 2.0](https://semver.org/). For this spec:
+
+- **Patch** (0.x.Y): clarifications, conformance refinements, no behavioural change.
+- **Minor** (0.Y.0): additions to the harness API, schema, or CLI that do not break existing implementations.
+- **Major** (X.0.0): breaking changes to schema, hook contracts, or harness API. v1.0 is reserved for the first non-draft release.
+
+While the spec is on `0.x.y-draft`, all sections are subject to change. v1.0.0 freezes §§3 (Data Model), 4 (Phase State Machine), 6 (Worker Attempt Lifecycle), 10 (Hooks), 14 (Configuration), and 26 (Conformance) — changes to those sections post-v1 require a major bump. It MUST NOT rebuild what Crush already provides:
 
 - Agent loop via `charm.land/fantasy`
 - Multi-provider LLM (Anthropic, OpenAI, Gemini, Groq, Bedrock, Azure, Ollama) via `charm.land/catwalk`
@@ -292,12 +302,21 @@ CREATE TABLE agents (
     system       TEXT NOT NULL,          -- system prompt template
     model        TEXT NOT NULL,
     state        TEXT NOT NULL DEFAULT 'idle' CHECK (state IN ('idle','running','waiting','stopped')),
-    capabilities TEXT,                   -- JSON array of capability tags (e.g. ["go","testing"])
+    capabilities TEXT,                   -- JSON array of capability tags; cached in agent_capabilities
     max_turns_per_run INTEGER NOT NULL DEFAULT 100,
     archived_at  INTEGER,                -- soft-delete; non-NULL = archived
     created_at   INTEGER NOT NULL,
     last_active  INTEGER
 );
+
+-- Indexed lookup table for capability matching (handoff "capability:tag1,tag2").
+-- Maintained in sync with agents.capabilities by the agent CRUD layer.
+CREATE TABLE agent_capabilities (
+    agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    capability   TEXT NOT NULL,
+    PRIMARY KEY (agent_id, capability)
+);
+CREATE INDEX agent_capabilities_by_tag ON agent_capabilities(capability, agent_id);
 
 CREATE TABLE agent_memory_blocks (
     agent_id     TEXT NOT NULL REFERENCES agents(id),
@@ -1027,6 +1046,17 @@ For successful calls: `success = true`, `output` = result summary. For unsupport
 
 If the agent calls a tool that is not registered, the harness MUST return a structured failure response and continue the session. It MUST NOT stall, panic, or exit on an unknown tool name.
 
+### 10.5.0 SF tool registration
+
+Crush uses `internal/agent/tools/` to register tool implementations exposed to the agent. SF adds new tools (`send_message`, `core_memory_append/replace`, `handoff`, `wait_for_reply`, `chapter_open`, `stop`, `tracker_query`, etc.) by registering them at boot via the same Crush API. There is NO parallel tool registry — SF tools live in `harness/tools/` and call into Crush's registration during `init()`.
+
+SF-specific tools MUST:
+1. Conform to the response shape of § 10.4 (`{success, output, contentItems}`).
+2. Honour Crush's `PreToolUse` hook system — they receive the same hook pipeline as built-in tools.
+3. Document the auto_approve key they expect (e.g. `agent:send_message`) so projects can list them in `[harness.auto_approve.tools]`.
+
+This means PreToolUse hooks can deny SF tool calls just like any other; the auto-approve list scopes them; permissions are uniform.
+
 ### 10.5 Doc sync (sub-step of PhaseMerge or PhaseComplete)
 
 Doc sync runs as the final sub-step of the **last code-mutating phase** before `PhaseComplete`:
@@ -1170,11 +1200,40 @@ post_milestone = ["./gates/integration-tests.sh"]
 
 - Gates run as subprocesses. The `UnitResult` JSON is passed via stdin.
 - Exit 0 = pass. Non-zero = fail.
-- Fail increments the retry counter for that unit.
-- Default max retries: 3. Configurable per gate type.
+- Fail increments the gate-level retry counter (separate from `units.attempt`). The gate retry counter resets on the next phase transition.
+- Default max gate retries: 3. Configurable per gate via `[harness.gates.max_retries.<gate-name>]`.
 - On retry, the harness re-dispatches the same unit with gate failure output appended to context. The agent MUST see what failed and why.
 - After max retries, the harness transitions to `PhaseReassess` and emits `GateBlocked` on pubsub.
 - Gate results MUST be stored in `gate_results` table and written as span events on the unit span.
+
+### 13.2.1 Gate script protocol
+
+Every gate script MUST adhere to this contract. Implementations that violate any rule are rejected at startup validation.
+
+**Environment variables provided:**
+
+| Variable | Value |
+|---|---|
+| `SF_PROJECT_ROOT` | Absolute path to project root |
+| `SF_HOME` | SF data directory (`~/.sf` or override) |
+| `SF_UNIT_ID` | Active unit ID (§ 2 format) |
+| `SF_RUN_ID` | Active run ULID |
+| `SF_PHASE` | Phase name (e.g. `verify`) |
+| `SF_ATTEMPT` | Attempt counter, 1-indexed |
+| `SF_GATE_NAME` | This gate's name (script basename without extension) |
+| `SF_GATE_RETRY` | Gate retry counter, 0-indexed |
+| `SF_WORKSPACE` | Path of the unit's workspace |
+| `SF_TRACE_FILE` | Path to current day's trace JSONL |
+
+**Stdin:** the `UnitResult` JSON struct (§ 10.2). UTF-8, single line, terminated with `\n`.
+
+**Exit code:** `0` = pass; `1` = fail (retry); `2` = block (do not retry, transition straight to PhaseReassess); `3` = skip (gate is not applicable for this unit). Other codes are treated as `1`.
+
+**Stdout / stderr:** captured combined, truncated at 8 KB, stored in `gate_results.output`. Multi-line is fine. No structured output is required, but if the first line is valid JSON of the form `{"summary": "...", "issues": [...]}` the harness uses it for richer reporting.
+
+**Timeout:** default 5 minutes per gate, configurable via `[harness.gates.timeouts.<gate-name>]`. Timeout = SIGTERM, then 10s grace, then SIGKILL; recorded as `error_code = "gate_timeout"`.
+
+**Cwd:** the workspace directory. Scripts MAY assume `git status` etc. work as expected.
 
 ```go
 type GateResult struct {
@@ -1352,7 +1411,46 @@ Changing session-immutable fields requires restart. **If a dynamic reload detect
 
 The harness MUST validate config at startup and MUST fail fast with a descriptive error on invalid config. It MUST NOT silently ignore unknown keys or bad values. `/sf doctor` MUST run `HarnessConfig.Validate()` as one of its checks.
 
-### 14.5 Project directory layout
+### 14.5 Plan.md format
+
+Every active unit has a `.sf/active/{unit-id}/plan.md` written by `PhasePlan` and consumed by all subsequent phases. The format is:
+
+```markdown
+---
+unit_id: task/m1/s2/t3
+created_at: 2026-04-29T14:22:00Z
+written_by: claude-sonnet-4-6
+plan_version: 1
+---
+
+# Goal
+
+<one paragraph: what success looks like>
+
+# Approach
+
+<2-3 paragraphs: how the agent intends to do it>
+
+# Deliverables
+
+- [ ] <concrete file or behavioural change>
+- [ ] <…>
+
+# Verification
+
+- <gate or check that proves done>
+- <…>
+
+# Notes
+
+<context, gotchas, anti-patterns to avoid for this unit>
+```
+
+The frontmatter `plan_version` increments on each PhaseReassess→Re-plan. Subsequent phases parse the frontmatter to detect plan version changes (informational; not load-bearing).
+
+The harness MUST validate that `plan.md` parses as Markdown with the required frontmatter fields before allowing a transition out of `PhasePlan`. Missing `# Goal` or `# Deliverables` sections fail the phase.
+
+### 14.6 Project directory layout
 
 Every project has a `.sf/` directory with this canonical layout:
 
@@ -1458,6 +1556,53 @@ CREATE TABLE pending_retain (
 ```
 
 `pending_retain` rows older than 7 days are flushed to `.sf/archive/lost-learnings.jsonl` and removed; at that point the operator is expected to investigate.
+
+### 16.1.1 Hindsight client interface
+
+The harness uses `hindsight-client-go` through a thin wrapper that the rest of the codebase depends on. This wrapper is the seam between SF and Hindsight; tests substitute a fake.
+
+```go
+type Hindsight interface {
+    // Recall fetches top-k entries from a bank for a query. opts.Filter
+    // may include {"collection": "anti_patterns"} or other tags.
+    Recall(ctx context.Context, bank string, query string, opts RecallOpts) ([]Memory, error)
+
+    // Retain stores a new memory in a bank. document_id is required for
+    // upsert-by-content-hash semantics (§ 16.3).
+    Retain(ctx context.Context, bank string, mem Memory) error
+
+    // Feedback signals helpfulness of a memory recalled in this dispatch.
+    // signal ∈ {-1, 0, +1}; +1 resets decay timer.
+    Feedback(ctx context.Context, memID string, signal int) error
+
+    // Validate marks the memory as still-relevant (resets decay timer).
+    // Called by PostUnit when a recalled memory directly contributed to success.
+    Validate(ctx context.Context, memID string) error
+
+    // Health probe. Used by /sf doctor and the retain queue.
+    Health(ctx context.Context) error
+}
+
+type RecallOpts struct {
+    TopK          int
+    Filter        map[string]string
+    RerankQuality string                // "fast" | "accurate"
+}
+
+type Memory struct {
+    DocumentID string                   // content hash; upsert key
+    Content    string
+    Tags       []string
+    Metadata   map[string]string        // includes maturity, decay_factor, etc.
+    Score      float64                  // populated on Recall, ignored on Retain
+}
+```
+
+The wrapper is responsible for:
+1. Translating SF's `last_error` and gate output into Memory.Content.
+2. Adding `is_negative` and `collection` tags appropriately.
+3. Routing Hindsight transport errors through `pending_retain` (§ 16.1).
+4. Exposing the local `local_anti_patterns` mirror to `Recall` when Hindsight is unreachable.
 
 ### 16.2 Memory tiers
 
@@ -1782,7 +1927,13 @@ CREATE INDEX trace_index_started_at ON trace_index(started_at);
 CREATE INDEX trace_index_trace_id ON trace_index(trace_id);
 ```
 
-The index is populated by the trace writer goroutine after a successful flush. `/sf forensics <run-id>` queries the index, then seeks into the JSONL files for full payloads. JSONL files older than 30 days MAY be moved to `<project>/.sf/archive/trace/` — the index continues pointing into the archived files until it is GC'd by `/sf clean`.
+The index is populated by the trace writer goroutine after a successful flush. `/sf forensics <run-id>` queries the index, then seeks into the JSONL files for full payloads.
+
+JSONL files older than 30 days MAY be moved to `<project>/.sf/archive/trace/` by `/sf clean`. The move MUST be a single transaction:
+1. Move the JSONL file to `archive/trace/`.
+2. UPDATE `trace_index SET file_path = REPLACE(file_path, '.sf/trace/', '.sf/archive/trace/') WHERE file_path = ?`.
+
+Both steps under a process-level lock so a concurrent forensics query never observes a half-renamed state. If `/sf clean` is interrupted mid-move, on next run it detects the file in archive but index pointing to original path and repairs by re-running the UPDATE.
 
 ### 19.4 Intent chapters
 
@@ -1855,7 +2006,9 @@ The harness MUST expose a lightweight HTTP server on `localhost` when `server.po
 
 ### 19.6 Rate-limit tracking
 
-The harness MUST track the latest rate-limit payload from any provider event and surface it in the TUI and HTTP API. Rate-limit data is observability-only — no retry logic is driven by it. Circuit breaker and backoff handle retries separately.
+The harness MUST track the latest rate-limit payload from any provider event and surface it in the TUI and HTTP API. Rate-limit data is observability-only — no retry logic is driven by it.
+
+**Why not actively throttle on rate limits?** Three reasons: (a) rate limit headers vary in format and meaning across providers (Anthropic's `anthropic-ratelimit-tokens-remaining` vs OpenAI's `x-ratelimit-remaining-tokens` differ in semantics — input-only vs total), (b) the model router (§ 15) already moves between providers, so a single provider's pressure does not need to feed back into dispatch, (c) the circuit breaker (§ 9.3) handles repeated provider failures including 429. Rate-limit data is for the operator to see what's happening, not for the orchestrator to react to.
 
 ---
 
@@ -2176,6 +2329,50 @@ Inspect the trace for a specific unit or session. Shows all spans, tool calls, p
 
 Clear all tripped circuit breakers. Next dispatch uses benchmark scores to select within each tier normally.
 
+### `/sf reassess-resolve <unit-id> "operator response"`
+
+Resume a unit that entered `PhaseReassess` with the **Escalate** outcome (§ 4.6). The operator's response is appended as the next attempt's `last_error` so the agent can incorporate it. The unit re-enters `PhasePlan`.
+
+### `/sf force-clear <blocker-id>`
+
+Operator override: mark a `session_blockers` row resolved with `resolved_by = "/sf force-clear"`. Used to dismiss stuck `GateBlocked` events that can't auto-resolve (e.g. flaky external test infrastructure).
+
+### `/sf merge-resolve <unit-id>`
+
+Resume a unit halted on `MergeConflict`. Assumes the operator has resolved the conflict in the worktree. Triggers re-emission of `MergeReady`.
+
+### `/sf uat-approve <unit-id>` and `/sf uat-reject <unit-id> "reason"`
+
+Advance a unit out of `PhaseUAT` (§ 4.6). Approve transitions to `PhaseMerge`; reject transitions to `PhaseReassess` with the reason as `last_error`.
+
+### `/sf agent <subcommand>`
+
+Persistent agent management:
+
+- `/sf agent list` — show all agents with state, last_active, capabilities.
+- `/sf agent run <name> "message"` — wake an agent with an ad-hoc message (bypasses inbox routing).
+- `/sf agent reset <name>` — clear hot cache and reset Budget; memory blocks and message history preserved.
+- `/sf agent delete <name>` — soft-delete (sets `archived_at`); runs and messages preserved via snap_ columns.
+- `/sf agent inspect <name>` — show memory blocks, recent messages, current state.
+- `/sf agent history <name>` — query archived inbox in `.sf/archive/agents/{id}/`.
+
+### `/sf history [filters]`
+
+Query archived units in `.sf/archive/`. Filter syntax:
+
+```
+/sf history --since 2026-04-01 --phase merge --verdict success
+/sf history --workflow spike
+/sf history --model claude-sonnet-4-6 --limit 50
+/sf history --json   # machine-readable output for automation
+```
+
+Filters are AND-combined. Without filters, returns the most recent 20 archived units. The query reads from `runs` table joined with archive metadata; full unit artifacts are accessible at `.sf/archive/{date}-{unit-id}/`.
+
+### `/sf clean [--dry-run]`
+
+Garbage-collect: rotate trace JSONL older than 30 days to `.sf/archive/trace/`, evict `pending_retain` rows older than 7 days to `lost-learnings.jsonl`, vacuum SQLite. `--dry-run` shows what would be removed.
+
 ---
 
 ## 26. Conformance Checklist
@@ -2275,6 +2472,16 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-81** Turn outcome marker parsed from last 200 chars: `<turn_status>complete|blocked|giving_up</turn_status>`; blocked → SignalPause, giving_up → PhaseReassess.
 - [ ] **C-82** Agent handoff supports `capability:tag1,tag2` form; round-robin by `last_active` among matching agents; `ErrNoCapableAgent` if none.
 - [ ] **C-83** Provider API keys MUST use `vault://`; plaintext rejected at startup validation.
+- [ ] **C-84** Gate script protocol: env vars (SF_PROJECT_ROOT, SF_UNIT_ID, SF_RUN_ID, SF_PHASE, SF_ATTEMPT, SF_GATE_NAME, SF_GATE_RETRY, SF_WORKSPACE, SF_TRACE_FILE), stdin = UnitResult JSON, exit codes 0/1/2/3, output truncated at 8 KB.
+- [ ] **C-85** Gate retry counter is separate from `units.attempt`; resets on phase transition.
+- [ ] **C-86** `plan.md` frontmatter (unit_id, created_at, written_by, plan_version) + sections (Goal, Approach, Deliverables, Verification, Notes) validated before transition out of PhasePlan.
+- [ ] **C-87** `Hindsight` interface (Recall, Retain, Feedback, Validate, Health); `pending_retain` queue routes failed Retains; `local_anti_patterns` mirror exposed when Hindsight unreachable.
+- [ ] **C-88** SF tools registered through Crush's `internal/agent/tools/`; PreToolUse hooks apply uniformly; auto_approve keys documented per tool.
+- [ ] **C-89** All operator commands referenced elsewhere in spec are present in § 25: reassess-resolve, force-clear, merge-resolve, uat-approve, uat-reject, agent {list,run,reset,delete,inspect,history}, history, clean.
+- [ ] **C-90** `agent_capabilities` index maintained in sync with `agents.capabilities`; capability lookup is index scan, not full table scan.
+- [ ] **C-91** Trace JSONL archive move is transactional with `trace_index.file_path` UPDATE; recoverable if interrupted.
+- [ ] **C-92** Versioning policy: SemVer; v1.0 freezes §§3, 4, 6, 10, 14, 26.
+- [ ] **C-93** [STRONG] Rate-limit data is observability-only; no orchestrator retry/dispatch logic reads it.
 
 ### 26.2 Knowledge layer (ship after core)
 

@@ -134,6 +134,7 @@ CREATE TABLE units (
     parent_id    TEXT REFERENCES units(id),           -- NULL for milestone; ≤ 3 levels deep
     type         TEXT NOT NULL CHECK (type IN ('milestone', 'slice', 'task')),
     workflow     TEXT NOT NULL,                       -- workflow template name; pinned at first dispatch
+    workflow_hash TEXT NOT NULL,                       -- SHA-256 of pinned template content (FK workflow_pins.hash)
     phase        TEXT NOT NULL,
     phase_status TEXT NOT NULL CHECK (phase_status IN
                    ('pending', 'running', 'succeeded', 'failed', 'canceled', 'interrupted')),
@@ -184,14 +185,26 @@ CREATE TABLE gate_results (
 );
 
 CREATE TABLE session_blockers (
-    id           TEXT PRIMARY KEY,
+    id           TEXT PRIMARY KEY,                        -- ULID
     session_id   TEXT NOT NULL REFERENCES sessions(id),
-    event        TEXT NOT NULL,          -- GateBlocked | MergeConflict | Paused
+    event        TEXT NOT NULL,                           -- GateBlocked | MergeConflict | Paused | UATPending
     unit_id      TEXT,
     detail       TEXT,
     created_at   INTEGER NOT NULL,
-    resolved_at  INTEGER
+    resolved_at  INTEGER,                                 -- non-NULL = resolved; see resolution rules below
+    resolved_by  TEXT                                     -- "user" | "auto" | command name (e.g. "/sf uat-approve")
 );
+
+-- Resolution rules:
+--   GateBlocked    : resolved when the gate passes on a subsequent attempt OR the unit
+--                    transitions to PhaseReassess; resolved_by = "auto" | "/sf force-clear"
+--   MergeConflict  : resolved on /sf revert, /sf merge-resolve, or git service hook;
+--                    resolved_by = command name
+--   Paused         : resolved on /sf resume; resolved_by = "user"
+--   UATPending     : resolved on /sf uat-approve or /sf uat-reject; resolved_by = command name
+--
+-- An unresolved blocker MUST be displayed in /sf status. The TUI also subscribes to
+-- the corresponding pubsub event (§ 10.1) for live updates.
 
 CREATE TABLE benchmark_results (
     id           TEXT PRIMARY KEY,
@@ -200,7 +213,7 @@ CREATE TABLE benchmark_results (
     fingerprint  TEXT NOT NULL,          -- phase+complexity+project hash
     quality      REAL NOT NULL,          -- 0.0 .. 1.0
     latency_p50  INTEGER NOT NULL,       -- milliseconds
-    cost_per_1k  REAL NOT NULL,
+    cost_per_1k_micro_usd INTEGER NOT NULL,    -- micro-USD per 1k tokens
     sample_count INTEGER NOT NULL DEFAULT 1,
     recorded_at  INTEGER NOT NULL
 );
@@ -232,13 +245,14 @@ CREATE TABLE runs (
     workspace    TEXT,                        -- workspace AT THIS attempt; authoritative for this run
     started_at   INTEGER NOT NULL,
     ended_at     INTEGER,
-    outcome      TEXT,                        -- success | failure | abandoned | canceled
-                                              --   | unit_timeout | turn_timeout | stalled
+    outcome      TEXT CHECK (outcome IS NULL OR outcome IN
+                  ('success','failure','abandoned','canceled','interrupted',
+                   'unit_timeout','turn_timeout','stalled')),
     error_code   TEXT,                        -- typed error from § 20.1; stores the string
                                               --   value of the const, e.g. "turn_timeout"
     input_tokens   INTEGER NOT NULL DEFAULT 0,
     output_tokens  INTEGER NOT NULL DEFAULT 0,
-    cost_usd       REAL NOT NULL DEFAULT 0,
+    cost_micro_usd INTEGER NOT NULL DEFAULT 0, -- cost in micro-USD (1e-6 USD); avoids float drift
     CHECK (
       (run_kind = 'unit_attempt'  AND unit_id_snap  IS NOT NULL AND agent_name_snap IS NULL AND attempt IS NOT NULL)
       OR
@@ -523,7 +537,16 @@ The workflow used for a given unit is determined in this order:
 2. Project default: `[harness] default_workflow = "feature"` in `.sf/config.toml`.
 3. Built-in fallback: `feature` (if available) else the first workflow in `.sf/workflows/`.
 
-The selected workflow is recorded in `units.workflow` at dispatch time and never re-evaluated for that unit, even on retry — workflow stability across attempts is a hard guarantee.
+The selected workflow is recorded in `units.workflow` at dispatch time and never re-evaluated for that unit, even on retry — workflow stability across attempts is a hard guarantee. Additionally, the *content* of the chosen template is hashed (SHA-256) and stored in `units.workflow_hash`. If the on-disk template changes mid-session, the harness uses the pinned hash's content (cached in SQLite at `workflow_pins.content`) for that unit; new units pick up the new content. This prevents in-flight units from silently changing rules.
+
+```sql
+CREATE TABLE workflow_pins (
+    hash         TEXT PRIMARY KEY,    -- SHA-256 of template content
+    name         TEXT NOT NULL,
+    content      TEXT NOT NULL,       -- frozen TOML at first pin
+    pinned_at    INTEGER NOT NULL
+);
+```
 
 ### 4.6 PhaseReassess
 
@@ -636,6 +659,21 @@ max_agents_by_phase.verify   = 10
 ### 5.5 Continuation retry and exponential backoff
 
 **After a normal (clean) exit** from a worker, the orchestrator MUST schedule a 1-second continuation retry to re-poll eligibility. If the unit is still active, a new session starts. If terminal, the claim is released. This is not a failure retry.
+
+### 5.4.1 Turn outcome signal
+
+Between transport-level "turn ran cleanly" and phase-level "gate passed," the harness MUST capture a per-turn semantic signal. After every turn, the harness inspects the model output for an explicit terminal marker:
+
+| Marker (in agent output) | Meaning | Effect |
+|---|---|---|
+| `<turn_status>complete</turn_status>` | Agent considers this turn's goal achieved | Recorded; allow continuation if max_turns_per_attempt not reached |
+| `<turn_status>blocked</turn_status>` | Agent stuck, need user input or escalation | Triggers `SignalPause` if auto-mode |
+| `<turn_status>giving_up</turn_status>` | Agent has decided the task can't be done | Ends attempt; transitions to PhaseReassess |
+| (no marker) | Default success | Continue normally |
+
+The marker is parsed from the last 200 chars of the agent's response. Markers appearing earlier are ignored (prevents partial-quote false positives). This gives the harness a checkpoint *between* turns without waiting for a phase boundary.
+
+The agent prompt template (`prompts/execute-task.md`) instructs the agent to emit one of these markers at end-of-turn. Compliance is best-effort — absence of a marker is treated as default success.
 
 **After an abnormal exit**, exponential backoff. `attempt` is 1-indexed (first try = 1, first retry = 2, …):
 
@@ -755,6 +793,8 @@ A `TurnContinuation` MUST receive a short guidance prompt, not the full task pro
 The `attempt` variable enables prompt templates to give different instructions to retrying agents vs. fresh starts. A retry prompt SHOULD include: `"your previous attempt failed with: {{last_error}} — focus on that specifically."` The harness injects `last_error` automatically on `attempt >= 2`.
 
 **`last_error` is only injected on `TurnFirst` of attempts ≥ 2.** Continuation turns within the same attempt have already established context and don't need it. A turn failure within an attempt always fails the entire attempt (§ 6); there are no mid-attempt error injections to reason about.
+
+`last_error` content MUST be capped at 4 KB. Larger payloads (gate output, lint dumps, traceback) are truncated head-and-tail: 2 KB from the start, marker `... [truncated, full payload at <path>] ...`, then 2 KB from the end. The full payload is written to `.sf/active/{unit-id}/last-error-full.txt` so the agent can `read_file` it if the truncated context isn't enough.
 
 ### 7.4 `turn_input_required` in auto-mode
 
@@ -1210,12 +1250,17 @@ verify   = "10m"
 review   = "15m"
 merge    = "5m"
 reassess = "20m"
+uat      = "0"     # 0 = no timeout (UAT can take days; advance via /sf uat-approve)
+
+[harness.concurrency.max_agents_by_phase]
+execute  = 4
+tdd      = 4
+verify   = 10      # mostly reads — cheap
+review   = 4       # parallel chunked review (§ 13.3)
+merge    = 1       # serial per project (§ 12.3)
 
 [harness.concurrency]
-max_agents                   = 10
-max_agents_by_phase.execute  = 4
-max_agents_by_phase.tdd      = 4
-max_agents_by_phase.verify   = 10
+max_agents = 10                  # global cap; per-phase caps under [harness.concurrency.max_agents_by_phase] above
 
 [harness.auto_approve]
 tools = ["bash:read", "fs:read", "git:status", "git:diff"]
@@ -1227,7 +1272,17 @@ after_create = "./hooks/after-create.sh"
 before_run   = "./hooks/before-run.sh"
 after_run    = "./hooks/after-run.sh"
 before_remove = "./hooks/before-remove.sh"
-timeout_ms   = 60000
+
+[harness.hooks.timeouts]   # per-hook overrides; defaults in § 10.3
+before_run = "120s"
+post_unit  = "60s"
+doc_sync   = "5m"
+
+[providers]
+# Crush-inherited provider settings live here.
+# API keys MUST use vault:// (§ 24); plaintext is rejected at startup.
+anthropic.api_key = "vault://secret/singularity-crush#anthropic_api_key"
+openai.api_key    = "vault://secret/singularity-crush#openai_api_key"
 
 [harness.gates]
 post_slice     = ["./gates/run-tests.sh"]
@@ -1245,6 +1300,11 @@ port = 7842   # 0 = ephemeral (tests)
 [worker]
 ssh_hosts                      = []
 max_concurrent_agents_per_host = 3
+ssh_auth_method                = "agent"   # "agent" | "key" | "key+agent"
+ssh_identity_file              = "~/.ssh/id_ed25519"  # used for "key" or "key+agent"
+ssh_known_hosts                = "~/.ssh/known_hosts" # MUST verify; no auto-trust
+ssh_disconnect_timeout         = "30s"
+host_quarantine                = "5m"
 
 [routing]
 research = "reasoning"
@@ -1281,7 +1341,12 @@ The following fields are session-immutable even with dynamic reload enabled:
 - `context_compact_at`
 - `context_hard_limit`
 
-Changing session-immutable fields requires restart.
+Changing session-immutable fields requires restart. **If a dynamic reload detects a changed session-immutable field, the harness MUST**:
+
+1. Log a warning naming the field, old value, new value.
+2. Continue using the in-process value for the current session.
+3. Display the change in `/sf status` as "config drift detected — restart to apply: <fields>".
+4. NOT crash and NOT auto-restart.
 
 ### 14.4 Startup validation
 
@@ -1413,6 +1478,14 @@ projectRecall := hindsight.Recall("project/"+projectHash, query)
 globalRecall  := hindsight.Recall("global/coding", query)
 // merge, deduplicate, inject top-N into unit context
 ```
+
+`projectHash` is derived deterministically (so the same project hits the same bank from any machine):
+
+1. If the project root is a git repository, `projectHash = sha256(canonical_remote_url)[:16]` where canonical_remote_url is the `origin` URL normalised (strip auth, lowercase host, drop trailing `.git`).
+2. If no git remote, `projectHash = sha256(absolute_path_with_real_user_home)[:16]`.
+3. The resolved hash is cached in `.sf/runtime/project-hash.json` to ensure stability if the remote changes (a cleared cache forces re-derivation; a project move under a different remote is a deliberate re-bank).
+
+This means a developer cloning the repo on a second machine hits the same Hindsight bank as their first machine. Different forks of the same project have different remotes and thus different banks — desired, because their context diverges.
 
 Concurrent `retain` calls from parallel slice workers use `document_id` derived from content hash. Duplicate memories silently overwrite rather than accumulate.
 
@@ -1600,18 +1673,26 @@ An agent calling `wait_for_reply(ticket_id)` transitions to `AgentWaiting`. The 
 
 ### 18.4 Agent handoff
 
-`handoff(to, context)` transfers the active task to a named specialist agent:
+`handoff(to, context)` transfers the active task to a specialist agent. `to` is either an agent name (exact match) or a capability tag string (e.g. `"capability:go"` or `"capability:sql,perf"`):
 
-1. The calling agent's current unit is suspended (not completed).
-2. The target agent receives the full task context (system prompt, memory blocks, last N messages) pre-loaded in its inbox.
-3. The calling agent transitions to `AgentWaiting` until the specialist replies.
-4. If the target agent is not found or is `AgentStopped`, `handoff` returns an error and the calling agent continues.
+1. **Resolution.** If `to` starts with `capability:`, the harness queries `agents` for an active agent (`archived_at IS NULL`, `state != 'stopped'`) whose `capabilities` JSON array includes ALL listed tags. If multiple match, the one with the lowest `last_active` wins (round-robin). If none match, `handoff` returns `ErrNoCapableAgent`.
+2. **Suspension.** The calling agent's current run is suspended (not completed).
+3. **Context delivery.** The target agent receives the full task context (system prompt, memory blocks at handoff time, last N messages) pre-loaded as a snapshot in its inbox.
+4. **Wait.** The calling agent transitions to `AgentWaiting` until the specialist replies (subject to `wait_for_reply` timeout).
+5. **Fallback.** If the target agent is not found or is `AgentStopped`, `handoff` returns an error and the calling agent continues.
 
 ```go
 // Tool the agent calls:
 // handoff(to: string, context: string) -> HandoffTicket
 // Agent calls wait_for_reply(ticket.id) to block until the specialist responds.
+//
+// to formats:
+//   "go-specialist"             — exact agent name
+//   "capability:go"             — first eligible agent with capability tag "go"
+//   "capability:sql,perf"       — agent with both "sql" AND "perf" tags
 ```
+
+Capability matching is the recommended form — it lets the agent fleet evolve without changing handoff call sites.
 
 ### 18.5 Append-only inbox log
 
@@ -1671,9 +1752,37 @@ type Span struct {
 ```
 
 - Every tool call, phase transition, model request, and hook execution MUST emit a span.
-- Spans MUST be written to `~/.sf/trace.jsonl` (rolls daily).
+- Spans MUST be written to `<project>/.sf/trace/trace-{YYYY-MM-DD}.jsonl` (rolls at local-midnight on first span emission after midnight).
 - Span emission MUST be non-blocking — use a buffered channel with a background writer goroutine.
 - MUST NOT drop spans. If the buffer is full, block briefly rather than discard.
+- The first line of each daily file MUST be a `_meta` record:
+  ```json
+  {"_meta":true,"trace_schema_version":1,"sf_version":"<semver>","created_at":"<rfc3339>"}
+  ```
+  Readers branch on `trace_schema_version`. Future schema changes bump the version; no in-place migration of historical files.
+
+### 19.3.1 Trace index for forensics
+
+JSONL is the source of truth for spans, but `/sf forensics` queries demand fast access to specific runs/units/sessions. The harness MUST maintain a small SQL index alongside the JSONL:
+
+```sql
+CREATE TABLE trace_index (
+    run_id       TEXT NOT NULL,
+    span_id      TEXT NOT NULL,
+    parent_span_id TEXT,
+    trace_id     TEXT NOT NULL,
+    operation    TEXT NOT NULL,        -- "tool_call" | "phase_transition" | "model_request" | "hook"
+    started_at   INTEGER NOT NULL,
+    duration_ms  INTEGER,
+    file_path    TEXT NOT NULL,        -- which JSONL file holds the full record
+    file_offset  INTEGER NOT NULL,     -- byte offset within the file
+    PRIMARY KEY (run_id, span_id)
+);
+CREATE INDEX trace_index_started_at ON trace_index(started_at);
+CREATE INDEX trace_index_trace_id ON trace_index(trace_id);
+```
+
+The index is populated by the trace writer goroutine after a successful flush. `/sf forensics <run-id>` queries the index, then seeks into the JSONL files for full payloads. JSONL files older than 30 days MAY be moved to `<project>/.sf/archive/trace/` — the index continues pointing into the archived files until it is GC'd by `/sf clean`.
 
 ### 19.4 Intent chapters
 
@@ -1701,6 +1810,10 @@ The agent MAY open a chapter explicitly via `chapter_open(name)`.
 ### 19.5 HTTP observability API
 
 The harness MUST expose a lightweight HTTP server on `localhost` when `server.port` is configured. The API is observability-only — orchestrator correctness MUST NOT depend on it.
+
+**Auth.** The server binds to `127.0.0.1` only. Every request MUST include header `Authorization: Bearer <token>` where token is read from `<project>/.sf/runtime/api.token` (generated as 32 random bytes hex on first start, mode 0600). Multi-user machines need this — `localhost` alone is insufficient. The actual port and token are written to `<project>/.sf/runtime/server.port` and `api.token` for tools to discover.
+
+**Session filter.** All endpoints accept `?session=<id>` to scope the response to one session. With no parameter, responses include all active sessions in the project DB; the response body has a top-level `sessions: [...]` array with the snapshot per session.
 
 **`GET /api/v1/state`** — runtime snapshot:
 
@@ -1780,6 +1893,9 @@ const (
     ErrCanceledByReconciliation = "canceled_by_reconciliation"
     ErrModelUnavailable         = "model_unavailable"
     ErrCircuitOpen              = "circuit_open"
+    ErrNoCapableAgent           = "no_capable_agent"
+    ErrSshDisconnected          = "ssh_disconnected"
+    ErrCanceledBySupervisor     = "canceled_by_supervisor"
 )
 ```
 
@@ -2043,8 +2159,10 @@ Run health checks:
 - Hindsight connectivity
 - SQLite schema version
 - Lock file state
-- `specs.check` on harness package
 - Workflow template syntax
+- HTTP API token presence + permissions
+
+Exit code: `0` if all checks pass, `1` if any FAIL or WARN. Useful in CI: `sf doctor || exit 1`. The TUI rendering shows pass/warn/fail per check; the JSON form (`/sf doctor --json`) returns a structured report for automation.
 
 ### `/sf history`
 
@@ -2063,6 +2181,14 @@ Clear all tripped circuit breakers. Next dispatch uses benchmark scores to selec
 ## 26. Conformance Checklist
 
 Use this checklist as the definition-of-done for each build phase. An implementation is **core-conformant** when all core items pass. **Extension-conformant** when all extension items also pass.
+
+Each item is tagged:
+
+- **[REQUIRED]** — MUST be present for conformance at its tier. Absence = non-conformant.
+- **[STRONG]** — SHOULD be present; departure requires a written rationale.
+- **[OPTIONAL]** — MAY be present; absence is acceptable.
+
+Default tag is **[REQUIRED]** unless explicitly noted.
 
 ### 26.1 Core (must ship)
 
@@ -2134,6 +2260,21 @@ Use this checklist as the definition-of-done for each build phase. An implementa
 - [ ] **C-66** PreToolUse hook decisions outrank auto_approve list (deny wins; allow falls through to auto-approve).
 - [ ] **C-67** Slice merge ordering: `code_depends_on` honoured; merges serialised per project.
 - [ ] **C-68** Doc-sync sub-step runs at end of last code-mutating phase (Merge if present, else Execute).
+- [ ] **C-69** Cost stored as `cost_micro_usd` INTEGER (1e-6 USD); float drift avoided.
+- [ ] **C-70** `session_blockers.resolved_at` set per resolution-rules table; `resolved_by` records source.
+- [ ] **C-71** Workflow content pinning via `workflow_pins(hash, name, content)`; in-flight units use pinned content even if template file changes.
+- [ ] **C-72** `projectHash` derivation: git-remote SHA-256 → fallback path SHA-256; cached in `.sf/runtime/project-hash.json`.
+- [ ] **C-73** Dynamic reload of session-immutable fields: warn, keep in-process value, surface in `/sf status` as drift; do NOT crash.
+- [ ] **C-74** `last_error` capped at 4 KB head-and-tail; full payload at `.sf/active/{unit-id}/last-error-full.txt`.
+- [ ] **C-75** SSH auth via agent / explicit key; `ssh_known_hosts` MUST verify; no auto-trust.
+- [ ] **C-76** UAT phase has timeout = 0 (infinite); advanced via `/sf uat-approve` or `/sf uat-reject`.
+- [ ] **C-77** HTTP API requires `Authorization: Bearer <token>` from `.sf/runtime/api.token` (mode 0600); `?session=<id>` filter supported.
+- [ ] **C-78** `/sf doctor` exit code 0 = all pass, 1 = any FAIL or WARN; `--json` returns structured report.
+- [ ] **C-79** Trace JSONL has `_meta` first-line record with `trace_schema_version`; readers branch on version.
+- [ ] **C-80** Trace SQL index (`trace_index`) populated by trace writer; `/sf forensics` queries it for fast span lookup.
+- [ ] **C-81** Turn outcome marker parsed from last 200 chars: `<turn_status>complete|blocked|giving_up</turn_status>`; blocked → SignalPause, giving_up → PhaseReassess.
+- [ ] **C-82** Agent handoff supports `capability:tag1,tag2` form; round-robin by `last_active` among matching agents; `ErrNoCapableAgent` if none.
+- [ ] **C-83** Provider API keys MUST use `vault://`; plaintext rejected at startup validation.
 
 ### 26.2 Knowledge layer (ship after core)
 

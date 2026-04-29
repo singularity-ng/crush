@@ -1,12 +1,21 @@
-# singularity-crush — Specification
+# sf v3 — Specification
 
-**Version:** 0.1.0-draft  
+**Version:** 1.0.0-draft  
 **Status:** Research / Pre-implementation  
-**Authors:** singularity-ng
+**Authors:** singularity-ng  
+**Implementation target:** the next major version of [`singularity-forge`](https://github.com/sf-build/get-shit-done) (sf, formerly Get-Shit-Done / GSD), built on the existing [pi-mono](https://github.com/badlogic/pi-mono) SDK packages already vendored under `packages/pi-*`. **Not** a fork of [charmbracelet/crush](https://github.com/charmbracelet/crush).
 
 ---
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **MAY**, and **OPTIONAL** in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+
+> **Retarget note (v1.0):** earlier draft versions (0.1–0.8) targeted a Go fork of Crush. That direction was reconsidered after recognising:
+> - sf already has gen-2 harness control via pi-mono (vs. gen-1 skills which proved insufficient).
+> - The cold-start performance argument for Go is largely moot once the daemon (`packages/daemon`) absorbs startup cost.
+> - sf already ships an MCP server (`packages/mcp-server`) — meaning other agent CLIs can call sf as a backend, not the inverse.
+> - Most of the Crush infrastructure we'd inherit (TUI, agent loop, multi-provider) is duplicated in pi-mono.
+>
+> The structure of the previous spec — phase machine, schema, hook pipeline, knowledge layer, persistent agents, conformance checklist — survives this retarget. The implementation target changes from Go-on-Crush to TypeScript-on-pi-mono.
 
 ---
 
@@ -43,34 +52,54 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **
 
 ## 1. Overview
 
-singularity-crush is an autopilot layer built on top of [charmbracelet/crush](https://github.com/charmbracelet/crush). Crush is an interactive coding agent — a human drives it turn by turn. singularity-crush adds a harness that drives Crush autonomously through a structured phase sequence (research → plan → execute → verify → complete) without human intervention per unit, while the human watches or steers.
+sf is an **autopilot for software engineering work** that the user owns end-to-end: the user states a goal (`/sf plan "add OAuth"`) and sf decomposes, plans, executes, verifies, reviews, and merges through a structured phase pipeline without per-unit human intervention. The user watches or steers; the agent executes.
 
-singularity-crush is a **fork** of Crush, distributed as a single binary named `sf`. It re-uses Crush's `internal/` packages directly. Go's `internal/` visibility rule means only code in the same module tree may import `internal/...` — the fork model satisfies this constraint cleanly: singularity-crush's `harness/`, `tracker/`, etc. live alongside Crush's `internal/` in the same module (`github.com/singularity-ng/crush`). Vendoring or external imports would not work. The TUI's slash-command router is extended with the `/sf <subcommand>` namespace (§ 25); existing Crush slash commands (`/help`, `/clear`, etc.) continue to work unchanged. This means an `sf` user can drive interactively like vanilla Crush, then opt into autopilot via `/sf auto`.
+sf v3 is the next major version of singularity-forge, built directly on the [pi-mono](https://github.com/badlogic/pi-mono) SDK packages already vendored under `packages/pi-*`:
 
-### 1.1 Versioning
+| Vendored package | Role |
+|---|---|
+| `@singularity-forge/pi-coding-agent` | Coding agent CLI primitives (vendored from pi-mono) |
+| `@singularity-forge/pi-agent-core` | General-purpose agent core |
+| `@singularity-forge/pi-ai` | Unified LLM API across 20+ providers |
+| `@singularity-forge/pi-tui` | TUI primitives |
 
-singularity-crush follows [SemVer 2.0](https://semver.org/). For this spec:
+sf adds the autopilot layer on top: phase state machine, persistent agent fleet, knowledge integration with Singularity Memory, gates, hooks, worktree management, blockers and dispatch scheduling. The agent harness itself (tool execution, model calls, hook plumbing) is pi-mono's; the orchestration is sf's.
 
-- **Patch** (0.x.Y): clarifications, conformance refinements, no behavioural change.
-- **Minor** (0.Y.0): additions to the harness API, schema, or CLI that do not break existing implementations.
-- **Major** (X.0.0): breaking changes to schema, hook contracts, or harness API. v1.0 is reserved for the first non-draft release.
+### 1.1 Existing infrastructure
 
-While the spec is on `0.x.y-draft`, all sections are subject to change. v1.0.0 freezes §§3 (Data Model), 4 (Phase State Machine), 6 (Worker Attempt Lifecycle), 10 (Hooks), 14 (Configuration), and 26 (Conformance) — changes to those sections post-v1 require a major bump. It MUST NOT rebuild what Crush already provides:
+sf already ships:
 
-- Agent loop via `charm.land/fantasy`
-- Multi-provider LLM (Anthropic, OpenAI, Gemini, Groq, Bedrock, Azure, Ollama) via `charm.land/catwalk`
+- **`packages/daemon`** — long-lived background process that absorbs Node.js cold-start cost. The autopilot loop runs in the daemon; CLI invocations (`/sf status`, `/sf next`) talk to it via local RPC.
+- **`packages/mcp-server`** — exposes sf orchestration tools (plan/dispatch/status) via MCP so other agent CLIs (Claude Code, Cursor) can call sf as a backend.
+- **`packages/native`** — N-API bindings for performance-critical native (Rust) code where TypeScript would be too slow.
+- **`packages/rpc-client`** — standalone RPC client SDK with zero internal dependencies, used by the CLI to talk to the daemon.
+
+This spec defines the v3 contract that ties these together with the gen-2 harness control pattern that GSD established (drop into pi-mono primitives directly; do NOT layer skills on top and hope the LLM follows them).
+
+### 1.2 Versioning
+
+sf follows [SemVer 2.0](https://semver.org/). For this spec:
+
+- **Patch** (1.x.Y): clarifications, conformance refinements, no behavioural change.
+- **Minor** (1.Y.0): additions to the harness API, schema, or CLI that do not break existing implementations.
+- **Major** (X.0.0): breaking changes to schema, hook contracts, or harness API.
+
+v1.0.0 (this spec, when finalised) freezes §§3 (Data Model), 4 (Phase State Machine), 6 (Worker Attempt Lifecycle), 10 (Hooks), 14 (Configuration), and 26 (Conformance) — changes to those sections post-v1 require a major bump. sf v3 MUST NOT rebuild what pi-mono already provides:
+
+- Agent loop via `pi-coding-agent`
+- Multi-provider LLM (20+ providers including Anthropic, OpenAI, Gemini, Groq, Bedrock, Azure, Ollama) via `pi-ai`
 - MCP client (`modelcontextprotocol/go-sdk`)
 - LSP integration
 - SQLite state via `ncruces/go-sqlite3`
-- Bubbletea TUI + Lipgloss
+- TUI primitives via `pi-tui`
 - Tool execution (bash, file read/write, grep, web search, sourcegraph)
 - Agent Skills open standard (`internal/skills/`)
 - Permission service with pubsub, persistent grants, hook pre-approval
 - PreToolUse hook system with allow/deny/halt, input rewriting, multi-hook aggregation
 
-This specification covers only what singularity-crush adds. Behaviour already specified by Crush is inherited.
+This specification covers only what sf v3 adds on top of pi-mono. Behaviour already provided by the pi-mono SDK packages is inherited.
 
-**Project-level conformance.** singularity-crush itself MUST enforce godoc on every exported identifier in its harness packages via a CI check (`scripts/specs-check.go` — an AST walk, no external linter dependency). This applies to singularity-crush's own development; it is not a runtime gate against user projects.
+**Project-level conformance.** sf MUST enforce JSDoc on every exported function, type, and class in its harness modules via a CI check (`scripts/specs-check.ts` — an AST walk, no external linter dependency). This applies to sf's own development; it is not a runtime gate against user projects.
 
 ---
 
@@ -95,7 +124,7 @@ The slug encodes the parent hierarchy redundantly with `units.parent_id` to make
 
 **Session** — a top-level container scoped to one project, with a stable ULID, persisting across process restarts of the same project. A session is created on the first `/sf auto` or `/sf next` invocation in a project and reused on subsequent invocations until explicitly ended (`/sf session end`) or until 30 days of inactivity. The session holds the running state for all units, the context budget, and the supervisor state.
 
-**Harness** — the layer between the agent loop (fantasy) and SF's orchestration logic (milestones, phases, git, worktrees). It owns: context budget, phase transitions, unit lifecycle hooks, session contract, observability, and supervision. Nothing in the planning or git layers MUST reach past the harness boundary into fantasy directly.
+**Harness** — the layer between pi-coding-agent's agent loop and sf's orchestration logic (milestones, phases, git, worktrees). It owns: context budget, phase transitions, unit lifecycle hooks, session contract, observability, and supervision. Nothing in the planning or git layers MUST reach past the harness boundary into pi-coding-agent directly.
 
 **Worker** — the process (local or SSH-remote) that executes one attempt. Spawned by the orchestrator.
 
@@ -107,9 +136,9 @@ The slug encodes the parent hierarchy redundantly with `units.parent_id` to make
 
 **Workflow template** — a TOML file specifying the exact phase sequence the harness enforces for a class of work. Programmatic, not a suggestion to the agent.
 
-**Tracker** — the external system from which work is pulled (Linear, GitHub Issues, Jira, or built-in SQLite). The tracker is authoritative for unit status; the local `units` row mirrors it. See § 3.3.
+**Plan** — the local source of truth for work units. Created by the user via `/sf plan "..."` or by editing `.sf/plan.md`. Decomposed by sf into milestones → slices → tasks. There is no external tracker — sf's SQLite DB is authoritative. (External visibility, e.g. mirroring to GitHub Issues for teammates, is achieved via PostUnit hook scripts, not a built-in tracker integration. See § 10.)
 
-**Claim** — a soft lock recorded on a `units` row indicating the orchestrator is currently dispatching it. Stored as `claim_holder` (worker host or PID) and `claim_until` (UNIX ms expiry). A claim is released on terminal phase, worker exit, or claim expiry. Prevents two orchestrators or two workers picking up the same unit simultaneously. The orchestrator MUST sweep expired claims at the start of every poll tick: any row with `claim_until < now()` and `phase_status = 'running'` is reset to `phase_status = 'interrupted'` and `claim_holder = NULL`.
+**Claim** — a soft lock recorded on a `units` row indicating the orchestrator is currently dispatching it. Stored as `claim_holder` (worker host or PID) and `claim_until` (UNIX ms expiry). A claim is released on terminal phase, worker exit, or claim expiry. Prevents two workers picking up the same unit simultaneously. The orchestrator MUST sweep expired claims at the start of every poll tick: any row with `claim_until < now()` and `phase_status = 'running'` is reset to `phase_status = 'interrupted'` and `claim_holder = NULL`.
 
 **Run** — the unifying abstraction for one execution of the worker attempt lifecycle (§ 6). A run is either a **unit attempt** (driven by the phase state machine) or a **persistent agent run** (driven by inbox messages). The `runs` table (§ 3.5) records both, distinguished by `run_kind`. Trace, billing, and supervisor monitoring all key on `run_id`.
 
@@ -121,7 +150,7 @@ The orchestrator uses a single SQLite database **per project** at `<project>/.sf
 
 All primary keys for runtime-allocated rows (sessions, units, runs, agents, agent_messages, agent_inbox, gate_results, session_blockers, pending_retain) MUST be [ULIDs](https://github.com/ulid/spec) — sortable by creation time without a separate timestamp column. Schema-natural keys (model name, agent name) remain TEXT but are not ULIDs.
 
-The schema MUST be managed via sqlc and MUST use WAL mode:
+The schema MUST be managed via versioned migrations (Drizzle / Kysely) and MUST use WAL mode:
 
 ```sql
 PRAGMA journal_mode=WAL;
@@ -152,10 +181,9 @@ CREATE TABLE units (
     claim_holder TEXT,                                -- format: "{host}#{pid}" or "ssh:{host}#{pid}"
     claim_until  INTEGER,                             -- UNIX ms; claim auto-expires at this time
     priority     INTEGER,                             -- 1 (urgent) .. 4 (low); NULL sorts last
-    tracker_kind TEXT,                                -- matches tracker registry
-    tracker_id   TEXT,                                -- external ID in the tracker
     title        TEXT NOT NULL,
     description  TEXT,
+    metadata     TEXT,                                -- arbitrary JSON: gh_issue, slack_channel, custom keys
     worker_host  TEXT,                                -- "local" | SSH host name; current/last worker
     workspace    TEXT,                                -- path of latest workspace (current attempt)
     archived_at  INTEGER,                             -- soft-delete; non-NULL = archived/forgotten
@@ -350,95 +378,28 @@ CREATE TABLE agent_inbox (
 
 `agent_inbox` is append-only. Rows MUST NOT be deleted or modified after insert. `delivered` is the only mutable field.
 
-### 3.3 Task Tracker Integration
+### 3.3 No external tracker
 
-A **task tracker** is the external system from which the orchestrator pulls eligible work. The `units` row is a local mirror of an entry in some upstream tracker; the tracker is authoritative for issue state.
+sf v3 does **not** integrate with external task trackers (Linear, GitHub Issues, Jira). Work units are entirely local — created by `/sf plan "..."`, edited via `.sf/plan.md`, and stored in `units` (§ 3.1). The local SQLite DB is the only authoritative source of unit state.
 
-#### 3.3.1 Tracker interface
+This is a deliberate simplification from the earlier draft. Reasons:
 
-Every tracker plugin MUST implement:
+- sf's gen-2 model is "user states a goal, sf decomposes and executes" — not "team files tickets in Linear, sf picks them up." The autopilot doesn't need an external queue.
+- External tracker integration adds network dependency on the orchestrator's critical path (rate limits, outages, GraphQL pagination edge cases).
+- Symphony-style reconciliation (cancel mid-run when external state changes) doesn't apply when the only source is internal.
 
-```go
-type Tracker interface {
-    // Identifies which tracker_kind values this implementation handles.
-    Kind() string
+**External visibility is achieved via hooks, not core integration.** A PostUnit hook can call `gh issue comment`, `slack-cli send`, or any other publishing target to broadcast progress. Read-side stays in sf's DB; write-side goes through hooks. See § 10.5.1 for an example GH Issues publishing hook.
 
-    // Fetch eligible candidate units. Called every poll tick.
-    // The result is filtered locally before dispatch.
-    FetchCandidates(ctx context.Context, opts FetchOpts) ([]TrackerUnit, error)
+**Sources of truth for unit creation:**
 
-    // Re-fetch a single unit's authoritative state. Called between turns
-    // and during reconciliation.
-    FetchUnitState(ctx context.Context, trackerID string) (TrackerState, error)
-
-    // Optional: write the unit's state back (e.g. mark in-progress).
-    UpdateUnitState(ctx context.Context, trackerID string, state TrackerState) error
-}
-
-type TrackerUnit struct {
-    TrackerID    string            // external identifier
-    Title        string
-    Description  string
-    Priority     *int              // 1..4 or nil
-    Labels       []string
-    BlockedBy    []string          // upstream tracker IDs
-    Metadata     map[string]string // tracker-specific fields
-}
-
-type TrackerState struct {
-    Status   TrackerStatus // see § 3.3.2
-    UpdatedAt time.Time
-}
-```
-
-#### 3.3.2 Lifecycle states
-
-The tracker MUST report each unit's status as one of:
-
-| Status | Meaning | Eligible for dispatch? |
-|---|---|---|
-| `active` | Open, ready, in progress, queued | YES |
-| `blocked` | Waiting on upstream | NO (re-evaluated next tick) |
-| `done` | Completed, merged, closed-as-resolved | NO (terminal) |
-| `cancelled` | Closed-as-wontfix, deleted, archived | NO (terminal) |
-| `unknown` | Tracker returned a status the plugin couldn't classify | NO; logged as warning, treated as blocked |
-
-**Non-active** = anything except `active`. A unit transitioning from `active` to `done` or `cancelled` mid-run triggers `ReconciliationCancel` (§ 9.2) and the attempt enters `AttemptCanceled`.
-
-**`unknown` mid-run is a transient signal and MUST NOT cancel an in-flight attempt.** It only suppresses *new* dispatches. The orchestrator continues monitoring; if a subsequent fetch resolves the status to `done`/`cancelled`, then ReconciliationCancel fires. This protects against flaky tracker APIs.
-
-**`blocked` mid-run** is similarly non-cancelling — the in-flight attempt continues. The blocker resurgence is logged.
-
-#### 3.3.3 Built-in trackers
-
-| `tracker_kind` | Source |
+| Source | When |
 |---|---|
-| `linear` | Linear GraphQL API |
-| `github` | GitHub Issues + Projects |
-| `jira` | Jira REST v3 |
-| `sqlite` | Built-in local tracker — units defined in `.sf/tracker.toml`, stored in SQLite directly. Default for projects without an external tracker. |
+| `/sf plan "<goal>"` CLI command | Adds a milestone with sf-decomposed slices and tasks |
+| `.sf/plan.md` file edit | Declarative; sf re-reads and reconciles on `/sf plan reload` |
+| `/sf dispatch <ad-hoc-prompt>` | One-off task, no enclosing milestone |
+| `/sf agent run <name> "<message>"` | Wakes a persistent agent; not a unit (§ 17.1) |
 
-Additional trackers MAY be added via the `Tracker` plugin interface (§ 23).
-
-#### 3.3.4 ID mapping
-
-`units.tracker_kind` + `units.tracker_id` together identify the upstream entity. The harness MUST treat `(tracker_kind, tracker_id)` as a unique key — re-fetching the same upstream entity reuses the same `units.id`.
-
-`TrackerUnit.BlockedBy` returns upstream tracker IDs. The harness translates them to local `units.id` values when inserting/updating `task_blockers`:
-
-1. Look up local `units.id` by `(tracker_kind, blocked_by_tracker_id)`.
-2. If the local row does not yet exist, insert a placeholder unit with `phase = 'pending'` and `phase_status = 'pending'`. The next tracker fetch will fill in title/description.
-3. Insert `task_blockers (task_id = local_id, blocked_by = upstream_local_id)`.
-
-Until the upstream is materialised locally, the blocked unit remains queued — the placeholder is non-terminal and blocks dispatch by definition.
-
-#### 3.3.5 Failure handling
-
-Tracker errors do NOT crash the orchestrator (§ 20). Specifically:
-
-- `FetchCandidates` failure: skip this poll tick, retry next tick.
-- `FetchUnitState` failure mid-attempt: log warning, continue the turn loop. The next poll tick will re-fetch.
-- Persistent tracker outage: dispatched workers continue running on already-fetched state; no new dispatches occur until tracker recovers.
+There is no poll loop against any external API. The orchestrator's poll cycle (§ 5.1) reads only from local SQLite.
 
 ---
 
@@ -552,7 +513,7 @@ PhaseUAT halts the auto-loop with `SignalPause` and waits for `/sf uat-approve <
 
 The workflow used for a given unit is determined in this order:
 
-1. Explicit unit metadata: tracker label `sf:workflow=<name>` (if set).
+1. Explicit unit metadata: `metadata.workflow = "<name>"` set at `/sf plan` time.
 2. Project default: `[harness] default_workflow = "feature"` in `.sf/config.toml`.
 3. Built-in fallback: `feature` (if available) else the first workflow in `.sf/workflows/`.
 
@@ -580,7 +541,7 @@ The Reassess agent MUST output one of:
 | Outcome | Effect |
 |---|---|
 | **Re-plan** | Writes a new `plan.md`, transitions back to `PhasePlan`. Counter `max_reassess` decrements. |
-| **Abandon** | Writes a `decision.md` explaining why the task cannot succeed; transitions to `PhaseComplete` with verdict `abandoned`. The tracker is updated with the abandonment reason. |
+| **Abandon** | Writes a `decision.md` explaining why the task cannot succeed; transitions to `PhaseComplete` with verdict `abandoned`. Any registered visibility hook (e.g. GH Issues comment) fires from the standard PostUnit pipeline. |
 | **Escalate** | Halts auto-loop with `SignalPause`; writes a `human-question.md` with concrete questions for the operator. Resumes on `/sf reassess-resolve <unit-id>`. |
 
 If `max_reassess` hits zero on a Re-plan path, the next entry into PhaseReassess MUST be Abandon or Escalate; Re-plan is rejected.
@@ -601,7 +562,7 @@ In-memory scheduler state is intentionally not persisted (§ 20.2). On restart, 
 2. **Mark interrupted units.** All units with `phase_status = 'running'` are updated to `phase_status = 'interrupted'`. This is the only schema-level recovery action.
 3. **Run startup cleanup** (§ 5.6) — move stale active artifacts to archive.
 4. **Resume from the last committed phase boundary.** Each `interrupted` unit is treated as eligible for fresh dispatch; the worker re-enters at `unit.phase` with a new attempt number (`unit.attempt + 1`). The agent receives a `last_error` of `"resumed_after_crash"` so the prompt can warn the agent.
-5. **Begin polling.** Tracker reconciliation runs first to catch any status changes that happened during the outage.
+5. **Begin polling.** Resume normal poll cycle. Operator-issued `/sf abandon` commands made during the outage are visible via the next poll because they're persisted in `units.phase_status`.
 
 The harness MUST NOT replay tool calls. It MUST NOT attempt to "resume" a partial agent session. The crash recovery model is **fresh dispatch from the last persisted phase boundary**, not transparent continuation.
 
@@ -760,10 +721,10 @@ run_worker_attempt(unit, attempt):
       run_hook_best_effort("after_run", workspace, unit)
       fail_attempt(result.error)
 
-    # Re-check unit state between turns
-    current_state = tracker.fetch_unit_state(unit.id)
-    if current_state is non-active:
-      break  # → AttemptCanceled
+    # Re-check unit state between turns (local DB only — no external tracker)
+    current_state = db.fetch_unit_phase_status(unit.id)
+    if current_state in ('canceled', 'succeeded'):
+      break  # → AttemptCanceled (e.g. operator ran /sf abandon mid-run)
 
     if turn >= max_turns_per_attempt:
       break
@@ -912,7 +873,6 @@ const (
 | `TimeoutCheck` | Unit running longer than `unit_timeout` | `SignalAbort` |
 | `AbandonDetect` | Agent producing output with no tool calls | `SignalPause` |
 | `GitDivergence` | Working branch diverged from base unexpectedly | `SignalPause` |
-| `ReconciliationCancel` | Unit's underlying issue transitioned to non-active mid-run | `SignalAbort` (reason: `canceled_by_reconciliation`) |
 | `BlockerCheck` | Upstream dependency moved to non-terminal state mid-run | `SignalPause` |
 | `ModelUnavailable` | Provider returns "model not supported / not found" class error | `SignalAbort` immediately (not after timeout) |
 | `CircuitBreaker` | Same model fails 3 consecutive times within a session | Trip circuit; `SignalAbort` on next dispatch to tripped model |
@@ -952,11 +912,11 @@ After the tool call ends (cleanly or via SIGKILL), the harness records the run a
 
 ### 10.1 Events
 
-The harness extends Crush's existing `internal/hooks/` with SF-specific events:
+The harness extends pi-coding-agent's hook system with sf-specific events:
 
 ```go
 const (
-    // Existing Crush event
+    // Existing pi-coding-agent event
     EventPreToolUse    = "PreToolUse"
 
     // Unit lifecycle
@@ -1048,14 +1008,51 @@ If the agent calls a tool that is not registered, the harness MUST return a stru
 
 ### 10.5.0 SF tool registration
 
-Crush uses `internal/agent/tools/` to register tool implementations exposed to the agent. SF adds new tools (`send_message`, `core_memory_append/replace`, `handoff`, `wait_for_reply`, `chapter_open`, `stop`, `tracker_query`, etc.) by registering them at boot via the same Crush API. There is NO parallel tool registry — SF tools live in `harness/tools/` and call into Crush's registration during `init()`.
+pi-coding-agent (vendored from pi-mono under `packages/pi-coding-agent/`) provides the agent's tool registry. sf adds new tools (`send_message`, `core_memory_append/replace`, `handoff`, `wait_for_reply`, `chapter_open`, `stop`, `plan_unit`, etc.) by registering them at sf-startup via pi-coding-agent's API. There is NO parallel tool registry — sf tools live in `src/resources/extensions/sf/tools/` and call into pi-coding-agent's registration during module init.
 
-SF-specific tools MUST:
+sf-specific tools MUST:
 1. Conform to the response shape of § 10.4 (`{success, output, contentItems}`).
-2. Honour Crush's `PreToolUse` hook system — they receive the same hook pipeline as built-in tools.
+2. Honour pi-coding-agent's `PreToolUse` hook system — they receive the same hook pipeline as built-in tools.
 3. Document the auto_approve key they expect (e.g. `agent:send_message`) so projects can list them in `[harness.auto_approve.tools]`.
 
-This means PreToolUse hooks can deny SF tool calls just like any other; the auto-approve list scopes them; permissions are uniform.
+This means PreToolUse hooks can deny sf tool calls just like any other; the auto-approve list scopes them; permissions are uniform.
+
+### 10.5.1 External visibility via PostUnit hooks (recipe)
+
+If the user wants teammates to see sf's progress in GitHub Issues (or Slack, or any other system), this is done as a PostUnit hook script — **not** a built-in tracker integration.
+
+Example: `.sf/hooks/post-unit-gh.sh`
+
+```bash
+#!/usr/bin/env bash
+# Reads UnitResult JSON from stdin; posts a comment to a GitHub issue
+# whose number is stored in the unit's `external_ref` field (set at plan
+# time via /sf plan --link-issue=42 "...").
+
+set -euo pipefail
+payload="$(cat)"
+issue=$(jq -r '.unit.metadata.gh_issue // empty' <<< "$payload")
+verdict=$(jq -r '.verdict' <<< "$payload")
+phase=$(jq -r '.phase' <<< "$payload")
+[ -z "$issue" ] && exit 0   # not linked, no-op
+
+gh issue comment "$issue" --body "sf $phase: $verdict"
+```
+
+Wired in `.sf/config.toml`:
+
+```toml
+[harness.hooks]
+post_unit = ["./.sf/hooks/post-unit-gh.sh"]
+```
+
+The unit's `metadata.gh_issue` field is set at plan time:
+
+```bash
+sf plan --link-issue=42 "implement OAuth"
+```
+
+This pattern keeps the orchestrator's critical path local (sf's DB) while still giving external visibility where the user wants it. The same pattern works for Slack, Discord, Jira, Linear, in-house dashboards — sf doesn't need to know about any of them.
 
 ### 10.5 Doc sync (sub-step of PhaseMerge or PhaseComplete)
 
@@ -1267,7 +1264,7 @@ When a slice or milestone reaches `PhaseComplete`, the harness MUST move its art
 
 ### 13.5 Reserved
 
-(`specs.check`, godoc enforcement on the harness package, is a singularity-crush CI requirement — see § 1 — not a runtime gate against user projects.)
+(`specs.check`, godoc enforcement on the harness package, is a sf CI requirement — see § 1 — not a runtime gate against user projects.)
 
 ---
 
@@ -1338,10 +1335,10 @@ post_unit  = "60s"
 doc_sync   = "5m"
 
 [providers]
-# Crush-inherited provider settings live here.
+# pi-ai provider settings live here. pi-ai is the multi-provider client; sf inherits all 20+ providers it supports.
 # API keys MUST use vault:// (§ 24); plaintext is rejected at startup.
-anthropic.api_key = "vault://secret/singularity-crush#anthropic_api_key"
-openai.api_key    = "vault://secret/singularity-crush#openai_api_key"
+anthropic.api_key = "vault://secret/sf#anthropic_api_key"
+openai.api_key    = "vault://secret/sf#openai_api_key"
 
 [harness.gates]
 post_slice     = ["./gates/run-tests.sh"]
@@ -1359,7 +1356,7 @@ port = 7842   # 0 = ephemeral (tests)
 [memory]
 mode    = "embedded"                              # "embedded" (default) | "remote"
 url     = "http://memory.tailnet.local:7843"     # required when mode = "remote"
-api_key = "vault://secret/singularity-crush#sm_api_key"  # required when mode = "remote"
+api_key = "vault://secret/sf#sm_api_key"  # required when mode = "remote"
 # Embedded mode runs the singularity_memory_server engine in-process.
 # Remote mode shares the server across the fleet (Hermes, OpenClaw, sf, etc.).
 
@@ -1544,7 +1541,7 @@ Score mappings: `over=0.3` (over-resourced), `ok=0.8`, `under=0.0` (blocks model
 
 The knowledge layer is **Singularity Memory** (`sm`) — an HTTP + MCP server we own at [`singularity-ng/singularity-memory`](https://github.com/singularity-ng/singularity-memory). The engine was derived from [`vectorize-io/hindsight`](https://github.com/vectorize-io/hindsight) (MIT) and assimilated into `singularity_memory_server/` under our namespace; from sf's perspective there is no upstream service. The same `sm` server is shared across our agent fleet (Hermes, OpenClaw, Claude Code, Cursor, sf), so memories accumulate across tools.
 
-singularity-crush uses [`github.com/singularity-ng/singularity-memory-client-go`](https://github.com/singularity-ng/singularity-memory-client-go), auto-generated from the OpenAPI document published by the running sm server (`/openapi.json`). There is no local vector store, no sqlite-vec table, no FTS5 fallback — all retrieval and persistence go through `sm`.
+sf uses [`github.com/singularity-ng/singularity-memory-client-go`](https://github.com/singularity-ng/singularity-memory-client-go), auto-generated from the OpenAPI document published by the running sm server (`/openapi.json`). There is no local vector store, no sqlite-vec table, no FTS5 fallback — all retrieval and persistence go through `sm`.
 
 **Embedded vs remote deployment.** sm supports both modes:
 
@@ -1555,7 +1552,7 @@ singularity-crush uses [`github.com/singularity-ng/singularity-memory-client-go`
 
 Embedded mode eliminates the network hop for the common case. Switching to remote shares context across the fleet at the cost of a network round-trip per recall.
 
-SQLite in singularity-crush holds **orchestration state only** (sessions, units, blockers, gates, benchmarks, circuit breakers, agents). Memories, learnings, anti-patterns, and codebase context live in Singularity Memory.
+SQLite in sf holds **orchestration state only** (sessions, units, blockers, gates, benchmarks, circuit breakers, agents). Memories, learnings, anti-patterns, and codebase context live in Singularity Memory.
 
 When `sm` is unreachable, the harness MUST log a warning and dispatch with no recall context (plus the local `local_anti_patterns` mirror, § 3.1). The agent still runs; it just lacks historical memory for that session. The harness MUST NOT block dispatch on memory availability.
 
@@ -1726,7 +1723,7 @@ Deep analysis is default, not opt-in:
 
 ### 17.1 Agent vs unit
 
-A **unit** is ephemeral work pulled from a tracker (§ 3.3) and driven through the phase state machine (§ 4). It is archived on completion.
+A **unit** is ephemeral work created by `/sf plan` (or `.sf/plan.md`) and driven through the phase state machine (§ 4). It is archived on completion.
 
 A **persistent agent** is a named, long-lived identity: it has its own memory blocks, system prompt, and message history. It sleeps at zero cost when idle and wakes when its inbox receives a message or an explicit `/sf agent run <name>` is issued.
 
@@ -1734,7 +1731,7 @@ A **persistent agent** is a named, long-lived identity: it has its own memory bl
 
 | Aspect | Unit | Persistent agent run |
 |---|---|---|
-| Source of work | Tracker (§ 3.3) | Inbox message or explicit `/sf agent run` |
+| Source of work | User goal via `/sf plan` (§ 3.3) | Inbox message or explicit `/sf agent run` |
 | Phase state machine | YES | NO |
 | Verification gates | YES | NO |
 | Workflow templates | YES | NO |
@@ -2036,10 +2033,9 @@ Every harness failure has a class. The class determines recovery behavior.
 
 | Class | Examples | Recovery |
 |---|---|---|
-| `config` | Missing or invalid `.sf/workflows/*.toml`, invalid `.sf/config.toml`, unknown tracker kind, missing API key | Block new dispatches. Keep service alive. Continue reconciliation. Emit operator-visible error. |
+| `config` | Missing or invalid `.sf/workflows/*.toml`, invalid `.sf/config.toml`, missing API key | Block new dispatches. Keep service alive. Emit operator-visible error. |
 | `workspace` | Directory creation failure, hook timeout, invalid path | Fail the current attempt. Orchestrator retries with backoff. |
 | `agent_session` | Startup handshake failed, turn timeout, turn cancelled, subprocess exit, stalled session, `turn_input_required` (hard mode) | Fail the current attempt. Orchestrator retries with backoff. |
-| `tracker` | API transport error, non-200, GraphQL errors, malformed payload | **Candidate fetch failure**: skip this tick. **Reconciliation failure**: keep workers running, retry next tick. |
 | `observability` | Snapshot timeout, dashboard render error, log sink failure | Log and ignore. MUST NOT crash the orchestrator over an observability failure. |
 
 ### 20.1 Typed error codes
@@ -2048,8 +2044,6 @@ Every harness failure has a class. The class determines recovery behavior.
 const (
     ErrMissingWorkflowFile      = "missing_workflow_file"   // .sf/workflows/<name>.toml not found
     ErrWorkflowParseError       = "workflow_parse_error"
-    ErrUnsupportedTrackerKind   = "unsupported_tracker_kind"
-    ErrMissingTrackerKey        = "missing_tracker_api_key"
     ErrWorkspaceCreation        = "workspace_creation_failed"
     ErrWorkspaceSymlinkEscape   = "workspace_symlink_escape"
     ErrHookTimeout              = "hook_timeout"
@@ -2061,7 +2055,7 @@ const (
     ErrPromptRender             = "prompt_render_failed"
     ErrBudgetExhausted          = "budget_exhausted"
     ErrStalled                  = "stalled"
-    ErrCanceledByReconciliation = "canceled_by_reconciliation"
+    ErrCanceledByOperator       = "canceled_by_operator"     // user ran /sf abandon
     ErrModelUnavailable         = "model_unavailable"
     ErrCircuitOpen              = "circuit_open"
     ErrNoCapableAgent           = "no_capable_agent"
@@ -2092,7 +2086,7 @@ Every deployment MUST document its trust posture explicitly. There is no univers
 ### 21.2 Hardening measures for less-trusted environments
 
 - Filter which issues/tasks are eligible for dispatch — untrusted or out-of-scope tasks MUST NOT automatically reach the agent.
-- Restrict the tracker client-side tool to read-only or project-scoped mutations only.
+- Restrict the `plan_unit` client-side tool to read-only or scope-limited mutations only.
 - Run the agent subprocess under a dedicated OS user with no write access outside the workspace root.
 - Add container or VM isolation around each workspace (Docker, nsjail, etc.).
 - Restrict network access from the workspace.
@@ -2100,9 +2094,9 @@ Every deployment MUST document its trust posture explicitly. There is no univers
 
 ### 21.3 Auto-approval contract
 
-In auto-mode the harness calls Crush's existing `permission.AutoApproveSession()` ONLY for operations listed in `[harness.auto_approve]`. Sensitive operations (`fs:write-outside-project`, `shell:exec`) MUST always prompt regardless of auto-mode setting.
+In auto-mode the harness calls pi-coding-agent's existing permission API ONLY for operations listed in `[harness.auto_approve]`. Sensitive operations (`fs:write-outside-project`, `shell:exec`) MUST always prompt regardless of auto-mode setting.
 
-**Precedence between PreToolUse hooks and auto-approve.** Crush's PreToolUse hook system already runs before any tool call. If a PreToolUse hook returns `deny` or `halt`, the tool call is rejected even if `auto_approve` lists the tool. The order is:
+**Precedence between PreToolUse hooks and auto-approve.** pi-coding-agent's PreToolUse hook system already runs before any tool call. If a PreToolUse hook returns `deny` or `halt`, the tool call is rejected even if `auto_approve` lists the tool. The order is:
 
 1. PreToolUse hooks run first; their decision is final for `deny`/`halt`.
 2. If hooks return `allow` or no decision, the auto-approve list is consulted.
@@ -2155,7 +2149,7 @@ Zombies are the dominant failure mode for distributed execution; ignoring them p
 
 ## 23. Plugin Extension Points
 
-Plugin interfaces are activated when Crush's compile-time Go plugin system stabilises.
+Plugin interfaces are TypeScript classes implementing the listed contracts. sf loads them via dynamic import at boot from `.sf/plugins/`. Each plugin is a Node module exporting a default class with a marker method (e.g. `static readonly kind = "shipper"`).
 
 ### 23.1 Interfaces
 
@@ -2221,7 +2215,7 @@ type Notifier interface {
 Secrets MUST NOT be stored in config files in plaintext. The canonical secret reference format is:
 
 ```
-vault://secret/singularity-crush#anthropic_api_key
+vault://secret/sf#anthropic_api_key
 ```
 
 In config:
@@ -2229,7 +2223,7 @@ In config:
 ```json
 {
   "providers": {
-    "anthropic": { "api_key": "vault://secret/singularity-crush#anthropic_api_key" }
+    "anthropic": { "api_key": "vault://secret/sf#anthropic_api_key" }
   }
 }
 ```
@@ -2256,19 +2250,31 @@ Secrets MUST be fetched once at startup and held in memory for the session lifet
 
 ### 24.3 Stopgap
 
-Until the native resolver is built, use Crush's existing `$(command)` substitution:
+Until the native resolver is built, sf supports the same `$(command)` substitution that pi-mono inherits — embed a shell command:
 
 ```json
-{ "api_key": "$(vault kv get -field=anthropic_api_key secret/singularity-crush)" }
+{ "api_key": "$(vault kv get -field=anthropic_api_key secret/sf)" }
 ```
 
 ---
 
 ## 25. CLI Commands
 
+### `/sf plan "<goal>" [--workflow=feature] [--link-issue=<n>]`
+
+Add a milestone to the project's plan. sf decomposes into slices and tasks at runtime (Plan phase) but the milestone row is created immediately so it shows up in `/sf status`. `--link-issue=<n>` writes `metadata.gh_issue` for use by visibility hooks (§ 10.5.1). `--workflow=` overrides the default workflow template.
+
+### `/sf plan reload`
+
+Re-read `.sf/plan.md` and reconcile against current `units`. Adds new milestones, surfaces removed ones as `archived`, leaves in-flight units alone.
+
+### `/sf abandon <unit-id> "reason"`
+
+Operator override to mark a unit terminal mid-flight. Sets `phase_status = 'canceled'`, records the reason in `runs.error_code = "canceled_by_operator"`. Mid-turn workers detect the change at the next inter-turn check (§ 6) and exit cleanly.
+
 ### `/sf auto`
 
-Start the autonomous loop. The harness polls for eligible units and dispatches workers until no more eligible units exist or until stopped by `/sf pause`.
+Start the autonomous loop. The harness polls `units` for eligible work and dispatches workers until no more eligible units exist or until stopped by `/sf pause`.
 
 ### `/sf next`
 
@@ -2443,12 +2449,12 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-34** Intent chapters: open/close with intent summary; used for crash recovery context and Singularity Memory recall.
 - [ ] **C-35** Typed error codes; matching on error strings PROHIBITED.
 - [ ] **C-36** Scheduler state intentionally in-memory; restart re-dispatches from fresh poll.
-- [ ] **C-37** Project CI runs `specs.check`: AST-based godoc enforcement on all exported identifiers in singularity-crush's own harness packages. (Not a user-project runtime gate.)
+- [ ] **C-37** Project CI runs `specs.check`: AST-based godoc enforcement on all exported identifiers in sf's own harness packages. (Not a user-project runtime gate.)
 - [ ] **C-38** Vault secret resolution: `vault://path#field` URI scheme; auth chain: `VAULT_TOKEN` → `~/.vault-token` → AppRole; secrets MUST NOT be written to disk or logged.
 - [ ] **C-39** PhaseReview chunked at ≤ 300 lines per chunk.
 - [ ] **C-40** Unit archive: `.sf/active/` → `.sf/archive/{date}-{unit-id}/` on `PhaseComplete` via atomic rename.
-- [ ] **C-41** Tracker interface: `Kind`, `FetchCandidates`, `FetchUnitState`, `UpdateUnitState`; status enum `active | blocked | done | cancelled | unknown`; built-in `linear`, `github`, `jira`, `sqlite` adapters; `(tracker_kind, tracker_id)` is the unique upstream key.
-- [ ] **C-42** Tracker failures never crash the orchestrator: candidate-fetch failure skips tick; state-fetch failure mid-attempt logs and continues turn loop.
+- [ ] **C-41** No external tracker integration. The orchestrator polls only `units` in local SQLite. External visibility (GH Issues, Slack, etc.) is achieved via PostUnit hook scripts, not built-in adapters.
+- [ ] **C-42** Unit creation sources: `/sf plan "<goal>"` CLI, `.sf/plan.md` reload, `/sf dispatch <prompt>`. No background poll of any external API.
 - [ ] **C-43** Crash recovery: `running` units → `interrupted` on startup; re-dispatch fresh from last persisted phase boundary with `last_error = "resumed_after_crash"`; tool calls NOT replayed; agent sessions NOT resumed.
 - [ ] **C-44** Process lock at `~/.sf/run.lock`; stale-lock cleanup via `/proc` PID check.
 - [ ] **C-45** Doc-sync runs as a sub-step of `PhaseMerge` (not a separate phase, not a post-merge dispatch); empty diff is a no-op; user approval required unless `doc_sync_auto_approve = true`.
@@ -2456,9 +2462,9 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-47** Atomic claim acquisition: single conditional UPDATE pattern; rows_affected = 1 gates dispatch.
 - [ ] **C-48** `runs` table: CHECK constraint enforces XOR between unit_attempt and agent_run; aggregate token/cost are end-of-run rollup.
 - [ ] **C-49** `units.attempt` is current counter; historical attempts in `runs`; both updated in same transaction.
-- [ ] **C-50** Tracker `unknown` mid-run does NOT cancel in-flight attempts; only suppresses new dispatch. `blocked` mid-run also non-cancelling.
+- [ ] **C-50** Mid-run cancellation only via `/sf abandon <unit-id>` (operator) or supervisor signal; no automated cancellation from external state changes (since there is no external state).
 - [ ] **C-51** Singularity Memory retain failures queue in `pending_retain`; flush to `lost-learnings.jsonl` after 7d.
-- [ ] **C-52** Workflow selection priority: tracker label `sf:workflow=` → `default_workflow` config → built-in fallback. Pinned to unit at first dispatch; never re-evaluated.
+- [ ] **C-52** Workflow selection priority: `metadata.workflow` set at plan time → `default_workflow` config → built-in fallback. Pinned to unit at first dispatch; never re-evaluated.
 - [ ] **C-53** PhaseUAT trigger: workflow `require_uat = true`; halts auto-loop with `SignalPause`; resumes via `/sf uat-approve` or `/sf uat-reject`.
 - [ ] **C-54** Agent run termination conditions defined (inbox drain, stop tool, hard budget, turn cap, supervisor abort, timeout); hot cache NOT preserved across runs; durable blocks and message history ARE.
 - [ ] **C-55** `last_error` injected only on `TurnFirst` of `attempt >= 2`.
@@ -2494,7 +2500,7 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-85** Gate retry counter is separate from `units.attempt`; resets on phase transition.
 - [ ] **C-86** `plan.md` frontmatter (unit_id, created_at, written_by, plan_version) + sections (Goal, Approach, Deliverables, Verification, Notes) validated before transition out of PhasePlan.
 - [ ] **C-87** `Memory` interface (Recall, Retain, Feedback, Validate, Health) generated from sm's `/openapi.json`; `pending_retain` queue routes failed Retains; `local_anti_patterns` mirror exposed when sm unreachable.
-- [ ] **C-88** SF tools registered through Crush's `internal/agent/tools/`; PreToolUse hooks apply uniformly; auto_approve keys documented per tool.
+- [ ] **C-88** sf tools registered through pi-coding-agent's tool registry; PreToolUse hooks apply uniformly; auto_approve keys documented per tool.
 - [ ] **C-89** All operator commands referenced elsewhere in spec are present in § 25: reassess-resolve, force-clear, merge-resolve, uat-approve, uat-reject, agent {list,run,reset,delete,inspect,history}, history, clean.
 - [ ] **C-90** `agent_capabilities` index maintained in sync with `agents.capabilities`; capability lookup is index scan, not full table scan.
 - [ ] **C-91** Trace JSONL archive move is transactional with `trace_index.file_path` UPDATE; recoverable if interrupted.
@@ -2540,8 +2546,8 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **E-01** HTTP observability API: `GET /api/v1/state`, `GET /api/v1/units/<id>`, `POST /api/v1/refresh`.
 - [ ] **E-02** SSH worker extension: `worker.ssh_hosts`; remote workspace creation via shell script with symlink-aware validation; per-host concurrency cap.
 - [ ] **E-03** Durable retry queue across restarts (SQLite-backed).
-- [ ] **E-04** `tracker_query` client-side tool (agent reads/updates task state via orchestrator auth).
-- [ ] **E-05** Plugin interfaces: `SupervisorCheck`, `Shipper`, `VCS`, `Store`, `Notifier`.
+- [ ] **E-04** `plan_unit` client-side tool: agent can refine its own plan mid-run (add/split/reorder units). Uses orchestrator auth; subject to PreToolUse hooks.
+- [ ] **E-05** Plugin interfaces: `SupervisorCheck`, `Shipper`, `VCS`, `Store`, `Notifier`. (`Tracker` deliberately not in this list — see § 3.3.)
 
 ---
 

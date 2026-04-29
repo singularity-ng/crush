@@ -1542,9 +1542,9 @@ Score mappings: `over=0.3` (over-resourced), `ok=0.8`, `under=0.0` (blocks model
 
 ### 16.1 Architecture
 
-The knowledge layer is **Singularity Memory** (`sm`) — an HTTP + MCP server we own. The engine was derived from [`vectorize-io/hindsight`](https://github.com/vectorize-io/hindsight) (MIT) and assimilated into `singularity_memory_server/` under our namespace; from sf's perspective there is no upstream service. The same `sm` server is shared across our agent fleet (Hermes, OpenClaw, Claude Code, Cursor, sf), so memories accumulate across tools.
+The knowledge layer is **Singularity Memory** (`sm`) — an HTTP + MCP server we own at [`singularity-ng/singularity-memory`](https://github.com/singularity-ng/singularity-memory). The engine was derived from [`vectorize-io/hindsight`](https://github.com/vectorize-io/hindsight) (MIT) and assimilated into `singularity_memory_server/` under our namespace; from sf's perspective there is no upstream service. The same `sm` server is shared across our agent fleet (Hermes, OpenClaw, Claude Code, Cursor, sf), so memories accumulate across tools.
 
-singularity-crush uses `singularity-memory-client-go`, generated from `singularity-memory/openapi.yaml`. There is no local vector store, no sqlite-vec table, no FTS5 fallback — all retrieval and persistence go through `sm`.
+singularity-crush uses [`github.com/singularity-ng/singularity-memory-client-go`](https://github.com/singularity-ng/singularity-memory-client-go), auto-generated from the OpenAPI document published by the running sm server (`/openapi.json`). There is no local vector store, no sqlite-vec table, no FTS5 fallback — all retrieval and persistence go through `sm`.
 
 **Embedded vs remote deployment.** sm supports both modes:
 
@@ -1577,7 +1577,7 @@ CREATE TABLE pending_retain (
 
 ### 16.1.1 Memory client interface
 
-The harness uses `singularity-memory-client-go` (auto-generated from `openapi.yaml`) through a thin wrapper that the rest of the codebase depends on. This wrapper is the seam between sf and Singularity Memory; tests substitute a fake.
+The harness uses `github.com/singularity-ng/singularity-memory-client-go` (auto-generated from the sm server's `/openapi.json`) through a thin wrapper that the rest of the codebase depends on. This wrapper is the seam between sf and Singularity Memory; tests substitute a fake.
 
 ```go
 type Memory interface {
@@ -2493,7 +2493,7 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-84** Gate script protocol: env vars (SF_PROJECT_ROOT, SF_UNIT_ID, SF_RUN_ID, SF_PHASE, SF_ATTEMPT, SF_GATE_NAME, SF_GATE_RETRY, SF_WORKSPACE, SF_TRACE_FILE), stdin = UnitResult JSON, exit codes 0/1/2/3, output truncated at 8 KB.
 - [ ] **C-85** Gate retry counter is separate from `units.attempt`; resets on phase transition.
 - [ ] **C-86** `plan.md` frontmatter (unit_id, created_at, written_by, plan_version) + sections (Goal, Approach, Deliverables, Verification, Notes) validated before transition out of PhasePlan.
-- [ ] **C-87** `Memory` interface (Recall, Retain, Feedback, Validate, Health) generated from `singularity-memory/openapi.yaml`; `pending_retain` queue routes failed Retains; `local_anti_patterns` mirror exposed when sm unreachable.
+- [ ] **C-87** `Memory` interface (Recall, Retain, Feedback, Validate, Health) generated from sm's `/openapi.json`; `pending_retain` queue routes failed Retains; `local_anti_patterns` mirror exposed when sm unreachable.
 - [ ] **C-88** SF tools registered through Crush's `internal/agent/tools/`; PreToolUse hooks apply uniformly; auto_approve keys documented per tool.
 - [ ] **C-89** All operator commands referenced elsewhere in spec are present in § 25: reassess-resolve, force-clear, merge-resolve, uat-approve, uat-reject, agent {list,run,reset,delete,inspect,history}, history, clean.
 - [ ] **C-90** `agent_capabilities` index maintained in sync with `agents.capabilities`; capability lookup is index scan, not full table scan.
@@ -2502,7 +2502,7 @@ Default tag is **[REQUIRED]** unless explicitly noted.
 - [ ] **C-93** [STRONG] Rate-limit data is observability-only; no orchestrator retry/dispatch logic reads it.
 - [ ] **C-94** Singularity Memory is the sole knowledge backend; engine assimilated into `singularity_memory_server/` (MIT-attributed, no upstream runtime dep).
 - [ ] **C-95** `[memory] mode = "embedded"` is the default for single-user sf; `mode = "remote"` MUST require `url` and `api_key` (vault://).
-- [ ] **C-96** Go client `singularity-memory-client-go` is generated from `singularity-memory/openapi.yaml`; sf imports it as a normal Go module dependency.
+- [ ] **C-96** Go client `github.com/singularity-ng/singularity-memory-client-go` is generated from sm's `/openapi.json`; sf imports it as a normal Go module dependency.
 
 ### 26.2 Knowledge layer (ship after core)
 

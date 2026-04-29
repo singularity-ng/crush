@@ -374,3 +374,65 @@ Cross-platform matrix:
 - No Crush-as-script-interpreter mode (users can't write `#!/usr/bin/env crush`
   and have it mean something). If we want that later, it's an additive feature,
   not a dependency of this work.
+
+## SF harness hook events
+
+**Status:** planned, tied to singularity-crush harness build (see `harness.md`).
+
+Crush currently exposes only `PreToolUse`. The SF harness needs additional
+lifecycle events. These extend the existing hook aggregation system
+(`aggregate()` in `hooks.go`) — the same allow/deny/halt semantics apply.
+
+### New event types
+
+| Event | When it fires | Payload fields |
+|-------|--------------|----------------|
+| `PreDispatch` | Before a unit is dispatched to the agent | `unit_id`, `unit_type`, `phase`, `model`, `session_id` |
+| `PostUnit` | After a unit completes (success or failure) | Full `UnitResult` JSON — see `harness.md` § 10 |
+| `PhaseChange` | On every phase state machine transition | `from`, `to`, `unit_id`, `reason`, `timestamp` |
+| `AutoLoop` | Each iteration of auto-mode | `iteration`, `phase`, `budget_used_pct` |
+| `AgentWake` | When a persistent agent is woken by an inbox message | `agent_id`, `agent_name`, `from_agent`, `message_count` |
+| `AgentIdle` | When a persistent agent finishes its turn with no pending messages | `agent_id`, `agent_name`, `turns_run`, `tokens_used` |
+| `AgentMessage` | When `send_message(to, message)` is called between agents | `from_agent`, `to_agent`, `message_preview` |
+
+### PostUnit payload (abridged)
+
+```json
+{
+  "unit_id": "execute-task/m1/s2/t3",
+  "unit_type": "task",
+  "phase": "execute",
+  "verdict": "success",
+  "duration_ms": 42300,
+  "input_tokens": 18200,
+  "output_tokens": 2100,
+  "cost_usd": 0.043,
+  "model": "claude-sonnet-4-6",
+  "learnings": ["use --no-verify when running pre-commit in CI context"]
+}
+```
+
+`PostUnit` hooks that exit non-zero signal `SignalAbort` — the harness stops
+the session. Hooks that time out (default 30s) are killed and logged but do
+not block the next dispatch. This is the primary hook for: git commit/push,
+hermes-memory feedback, test gate execution, custom notifications.
+
+### AgentWake / AgentIdle hooks
+
+These fire per persistent agent, not per session. A hook on `AgentWake` can
+gate which agents are allowed to start (e.g. enforce a fleet size limit). A
+hook on `AgentIdle` is the natural place for post-turn git operations scoped
+to that agent's workspace.
+
+`AgentMessage` hooks fire before the message is delivered to the inbox. A
+`deny` decision drops the message and returns an error to the calling agent's
+`send_message` tool. Use this to enforce routing policy (e.g. an agent cannot
+message outside its designated group).
+
+### Aggregation behaviour for new events
+
+`PreDispatch` and `AgentWake` follow `PreToolUse` semantics: any `deny` or
+`halt` blocks the dispatch/wake. `PostUnit`, `AgentIdle`, and `AutoLoop` are
+notification-only — hooks cannot block these events, only observe them.
+`PhaseChange` and `AgentMessage` support `deny` to block the transition or
+message delivery respectively.

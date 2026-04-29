@@ -68,6 +68,13 @@ This specification covers only what singularity-crush adds. Behaviour already sp
 
 **Unit** — the atomic unit of work. Has a type (`milestone`, `slice`, `task`), a phase, and an attempt counter. Units are ephemeral — they complete or fail and are archived.
 
+Unit IDs use the format `{type}/{slug}` where slug is hierarchical:
+- Milestone: `milestone/m{n}` (e.g. `milestone/m2`)
+- Slice: `slice/m{n}/s{n}` (e.g. `slice/m2/s3`)
+- Task: `task/m{n}/s{n}/t{n}` (e.g. `task/m2/s3/t1`)
+
+The slug encodes the parent hierarchy redundantly with `units.parent_id` to make trace and log lines self-describing without requiring a join.
+
 **Phase** — a named stage of a unit's lifecycle. The harness owns all phase transitions; no other layer may transition a phase directly.
 
 **Attempt** — one dispatch of a worker for a unit. A unit may accumulate multiple attempts across failures and retries.
@@ -90,7 +97,9 @@ This specification covers only what singularity-crush adds. Behaviour already sp
 
 **Tracker** — the external system from which work is pulled (Linear, GitHub Issues, Jira, or built-in SQLite). The tracker is authoritative for unit status; the local `units` row mirrors it. See § 3.3.
 
-**Claim** — a soft lock recorded on a `units` row indicating the orchestrator is currently dispatching it. Stored as `claim_holder` (worker host or PID) and `claim_until` (UNIX ms expiry). A claim is released on terminal phase, worker exit, or claim expiry. Prevents two orchestrators or two workers picking up the same unit simultaneously.
+**Claim** — a soft lock recorded on a `units` row indicating the orchestrator is currently dispatching it. Stored as `claim_holder` (worker host or PID) and `claim_until` (UNIX ms expiry). A claim is released on terminal phase, worker exit, or claim expiry. Prevents two orchestrators or two workers picking up the same unit simultaneously. The orchestrator MUST sweep expired claims at the start of every poll tick: any row with `claim_until < now()` and `phase_status = 'running'` is reset to `phase_status = 'interrupted'` and `claim_holder = NULL`.
+
+**Run** — the unifying abstraction for one execution of the worker attempt lifecycle (§ 6). A run is either a **unit attempt** (driven by the phase state machine) or a **persistent agent run** (driven by inbox messages). The `runs` table (§ 3.5) records both, distinguished by `run_kind`. Trace, billing, and supervisor monitoring all key on `run_id`.
 
 ---
 
@@ -198,6 +207,37 @@ CREATE TABLE schema_migrations (
     version      INTEGER PRIMARY KEY,
     applied_at   INTEGER NOT NULL,
     description  TEXT
+);
+
+CREATE TABLE runs (
+    id           TEXT PRIMARY KEY,            -- ULID
+    run_kind     TEXT NOT NULL,               -- unit_attempt | agent_run
+    unit_id      TEXT REFERENCES units(id),   -- non-NULL when run_kind = unit_attempt
+    agent_id     TEXT REFERENCES agents(id),  -- non-NULL when run_kind = agent_run
+    attempt      INTEGER,                     -- only for unit_attempt
+    worker_host  TEXT,
+    workspace    TEXT,
+    started_at   INTEGER NOT NULL,
+    ended_at     INTEGER,
+    outcome      TEXT,                        -- success | failure | abandoned | canceled | timeout
+    error_code   TEXT,                        -- typed error from § 20.1, NULL on success
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    cost_usd       REAL NOT NULL DEFAULT 0
+);
+
+-- Local mirror of selected Hindsight entries that the harness needs offline.
+-- Limited to anti-patterns by default — small, high-value, MUST surface even
+-- if the Hindsight tailnet is down.
+CREATE TABLE local_anti_patterns (
+    id           TEXT PRIMARY KEY,
+    description  TEXT NOT NULL,
+    context      TEXT NOT NULL,
+    correct_path TEXT NOT NULL,
+    source_unit  TEXT,
+    fingerprint  TEXT,                        -- phase + project hash, for fast filter
+    created_at   INTEGER NOT NULL,
+    synced_at    INTEGER                      -- last time confirmed against Hindsight
 );
 ```
 
@@ -315,6 +355,14 @@ Additional trackers MAY be added via the `Tracker` plugin interface (§ 23).
 #### 3.3.4 ID mapping
 
 `units.tracker_kind` + `units.tracker_id` together identify the upstream entity. The harness MUST treat `(tracker_kind, tracker_id)` as a unique key — re-fetching the same upstream entity reuses the same `units.id`.
+
+`TrackerUnit.BlockedBy` returns upstream tracker IDs. The harness translates them to local `units.id` values when inserting/updating `task_blockers`:
+
+1. Look up local `units.id` by `(tracker_kind, blocked_by_tracker_id)`.
+2. If the local row does not yet exist, insert a placeholder unit with `phase = 'pending'` and `phase_status = 'pending'`. The next tracker fetch will fill in title/description.
+3. Insert `task_blockers (task_id = local_id, blocked_by = upstream_local_id)`.
+
+Until the upstream is materialised locally, the blocked unit remains queued — the placeholder is non-terminal and blocks dispatch by definition.
 
 #### 3.3.5 Failure handling
 
@@ -728,6 +776,20 @@ When the circuit trips for a model:
 - The supervisor MUST NOT write to agent state or SQLite unit state directly.
 - The auto-loop acts on `SignalPause` and `SignalAbort`. The TUI shows warnings on `SignalWarn`.
 
+### 9.5 SignalAbort and in-flight tool calls
+
+When the harness receives `SignalAbort` while a tool call is in flight (e.g. a long-running `bash` subprocess), it MUST follow this sequence:
+
+1. Cancel the tool call's context (Go `context.CancelFunc`). Cooperative cancellation MUST be honoured by built-in tools.
+2. Wait up to `[harness] tool_abort_grace = "5s"` for the tool to exit cleanly.
+3. After the grace period, send `SIGTERM` to any tool subprocess.
+4. Wait an additional `[harness] tool_abort_kill = "3s"`.
+5. If the subprocess is still running, send `SIGKILL`.
+
+Total worst case: 8 seconds from `SignalAbort` to forcible termination. The harness MUST NOT hang the orchestrator waiting on a non-cooperating tool call.
+
+After the tool call ends (cleanly or via SIGKILL), the harness records the run as `outcome = canceled` with `error_code = canceled_by_supervisor` and emits the `after_run` hook before releasing the slot.
+
 ---
 
 ## 10. Hook Pipeline
@@ -995,9 +1057,11 @@ Both files are TOML. Project overrides global on a per-key basis.
 [harness]
 context_compact_at    = 0.80
 context_hard_limit    = 0.95
-unit_timeout          = "10m"   # bounds one attempt: workspace creation through teardown
+unit_timeout          = "10m"   # default per-attempt cap; can override per phase
 turn_timeout          = "5m"    # bounds one model turn
 stall_timeout         = "2m"    # AttemptStalled when no agent event for this long
+tool_abort_grace      = "5s"    # cooperative cancel window before SIGTERM
+tool_abort_kill       = "3s"    # SIGTERM-to-SIGKILL window
 max_turns_per_attempt = 50
 max_attempts          = 6       # exponential backoff before giving up
 hot_cache_turns       = 10      # in-memory recent-turn buffer
@@ -1006,6 +1070,16 @@ max_retry_backoff     = "5m"
 doc_sync              = true
 turn_input_required   = "soft"  # or "hard"
 worktree_mode         = "branch-per-slice"
+
+[harness.unit_timeout_by_phase]
+research = "30m"   # AST analysis / spec reading can take real time
+plan     = "20m"
+execute  = "15m"
+tdd      = "10m"
+verify   = "10m"
+review   = "15m"
+merge    = "5m"
+reassess = "20m"
 
 [harness.concurrency]
 max_agents                   = 10
@@ -1089,7 +1163,7 @@ The harness MUST validate config at startup and MUST fail fast with a descriptiv
 
 ### 15.1 Three tiers
 
-Each tier holds multiple candidate models. The router picks within the tier; it does not change the tier assignment.
+The tier names are fixed: `fast`, `standard`, `reasoning`. Custom tier names are NOT supported — adding a tier would force changes in routing config, complexity-upgrade logic, and the rate-feedback fingerprint, with little benefit. Each tier holds multiple candidate models in `[tiers.<name>]`. The router picks within the tier; it does not change the tier assignment.
 
 ### 15.2 Phase → tier mapping
 
@@ -1164,6 +1238,7 @@ Anti-patterns are memories tagged `collection: anti_patterns`, `is_negative: tru
 - Are written explicitly when the agent makes a mistake (gate failure or user feedback).
 - MUST NOT be subject to normal maturation decay — they persist at full weight until explicitly removed.
 - Are retrieved at dispatch time and presented in a dedicated block: `<anti_patterns>avoid these mistakes...</anti_patterns>`.
+- MUST also be mirrored to the local `local_anti_patterns` SQLite table (§ 3.1) on `retain`. When Hindsight is unreachable, the harness still injects local anti-patterns into prompt context. Anti-patterns are small, high-value, and never decay — making them the one knowledge category worth duplicating locally.
 
 ```go
 type AntiPattern struct {
@@ -1345,9 +1420,15 @@ An agent calling `wait_for_reply(ticket_id)` transitions to `AgentWaiting`. The 
 
 `agent_inbox` MUST be append-only. Rows MUST NOT be deleted after insert. `delivered` is the only mutable column. This gives a complete audit trail of all inter-agent communication.
 
-Conflict resolution for shared state happens at read time (last-writer-wins on `agent_memory_blocks` by `updated_at`), not via locking.
+Inbox and message tables are subject to a periodic GC sweep: rows with `delivered = 1` and `created_at < now() - retain_window` are moved to `.sf/archive/agents/{agent_id}/inbox-{YYYY-MM}.jsonl` and deleted from the live tables. Default `retain_window = 30d`, configurable via `[harness] agent_inbox_retain = "30d"`. The archive is human-readable and queryable by `/sf agent history`.
 
-### 18.6 What not to build
+### 18.6 Memory block concurrency
+
+An agent's memory blocks are owned by that agent — they are NEVER shared with other agents (§ 18.7). Within a single agent, a turn's tool calls execute serially (one tool at a time), so two `core_memory_*` writes within a turn cannot race. Across turns, the harness commits the prior turn's writes before dispatching the next turn (§ 17.3).
+
+`handoff` does NOT share blocks — the receiving agent gets its own blocks. The `context` argument of `handoff` is a snapshot, not a reference.
+
+### 18.7 What not to build
 
 - **Shared memory** — agents MUST NOT share memory blocks. If two agents need a common fact, one sends it as a message.
 - **Broadcast** — there is no `send_message_all`. Routing MUST be explicit.

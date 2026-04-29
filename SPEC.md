@@ -60,6 +60,8 @@ singularity-crush is a fork of Crush. It MUST NOT rebuild what Crush already pro
 
 This specification covers only what singularity-crush adds. Behaviour already specified by Crush is inherited.
 
+**Project-level conformance.** singularity-crush itself MUST enforce godoc on every exported identifier in its harness packages via a CI check (`scripts/specs-check.go` — an AST walk, no external linter dependency). This applies to singularity-crush's own development; it is not a runtime gate against user projects.
+
 ---
 
 ## 2. Definitions
@@ -86,11 +88,17 @@ This specification covers only what singularity-crush adds. Behaviour already sp
 
 **Workflow template** — a TOML file specifying the exact phase sequence the harness enforces for a class of work. Programmatic, not a suggestion to the agent.
 
+**Tracker** — the external system from which work is pulled (Linear, GitHub Issues, Jira, or built-in SQLite). The tracker is authoritative for unit status; the local `units` row mirrors it. See § 3.3.
+
+**Claim** — a soft lock recorded on a `units` row indicating the orchestrator is currently dispatching it. Stored as `claim_holder` (worker host or PID) and `claim_until` (UNIX ms expiry). A claim is released on terminal phase, worker exit, or claim expiry. Prevents two orchestrators or two workers picking up the same unit simultaneously.
+
 ---
 
 ## 3. Data Model
 
-The orchestrator uses a single SQLite database (`~/.sf/sf.db`) shared across all sessions. The schema MUST be managed via sqlc and MUST use WAL mode:
+The orchestrator uses a single SQLite database (`~/.sf/sf.db`) for **orchestration state only**: sessions, units, phase transitions, blockers, gate results, benchmarks, circuit breakers, and persistent agents. **Knowledge** (memories, learnings, anti-patterns, codebase context) lives in Hindsight (§ 16), not SQLite.
+
+The schema MUST be managed via sqlc and MUST use WAL mode:
 
 ```sql
 PRAGMA journal_mode=WAL;
@@ -110,11 +118,16 @@ CREATE TABLE sessions (
 CREATE TABLE units (
     id           TEXT PRIMARY KEY,
     session_id   TEXT NOT NULL REFERENCES sessions(id),
+    parent_id    TEXT REFERENCES units(id),  -- milestone has NULL parent; slice's parent is milestone; task's parent is slice
     type         TEXT NOT NULL,          -- milestone | slice | task
     phase        TEXT NOT NULL,
-    phase_status TEXT NOT NULL,          -- pending | running | succeeded | failed | canceled
-    attempt      INTEGER NOT NULL DEFAULT 0,
+    phase_status TEXT NOT NULL,          -- pending | running | succeeded | failed | canceled | interrupted
+    attempt      INTEGER NOT NULL DEFAULT 1,  -- 1 = first try, 2 = first retry, ...
+    claim_holder TEXT,                   -- worker host/PID currently dispatching this unit; NULL = unclaimed
+    claim_until  INTEGER,                -- UNIX ms; claim auto-expires at this time
     priority     INTEGER,                -- 1 (urgent) .. 4 (low); NULL sorts last
+    tracker_kind TEXT,                   -- linear | github | jira | sqlite; matches tracker registry
+    tracker_id   TEXT,                   -- external ID in the tracker (issue ID, ticket key, etc.)
     title        TEXT NOT NULL,
     description  TEXT,
     worker_host  TEXT,                   -- NULL = local; binary = SSH host
@@ -171,36 +184,24 @@ CREATE TABLE benchmark_results (
     sample_count INTEGER NOT NULL DEFAULT 1,
     recorded_at  INTEGER NOT NULL
 );
-```
 
-### 3.2 Memory table (local cache, not Hindsight)
-
-```sql
-CREATE TABLE memories (
-    id            TEXT PRIMARY KEY,
-    content       TEXT NOT NULL,
-    embedding     F32_BLOB(2560),        -- Qwen3-Embedding-4B; NULL until indexed
-    decay_factor  REAL DEFAULT 1.0,
-    confidence    REAL DEFAULT 0.7,
-    maturity      TEXT DEFAULT 'candidate', -- candidate | established | proven | deprecated
-    is_negative   INTEGER DEFAULT 0,
-    helpful_hits  INTEGER DEFAULT 0,
-    harmful_hits  INTEGER DEFAULT 0,
-    access_count  INTEGER DEFAULT 0,
-    collection    TEXT DEFAULT 'default',
-    tags          TEXT,                  -- JSON array
-    last_accessed TEXT,
-    valid_until   TEXT,
-    superseded_by TEXT,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+CREATE TABLE circuit_breakers (
+    model        TEXT PRIMARY KEY,
+    tier         TEXT NOT NULL,
+    tripped_at   INTEGER NOT NULL,
+    resets_at    INTEGER NOT NULL,        -- UNIX ms; auto-reset deadline
+    fail_count   INTEGER NOT NULL DEFAULT 3,
+    reason       TEXT
 );
 
-CREATE VIRTUAL TABLE memories_fts USING fts5(content, tags, content=memories);
-CREATE INDEX memories_vector ON memories USING libsql_vector_idx(embedding);
+CREATE TABLE schema_migrations (
+    version      INTEGER PRIMARY KEY,
+    applied_at   INTEGER NOT NULL,
+    description  TEXT
+);
 ```
 
-### 3.3 Persistent agent tables
+### 3.2 Persistent agent tables
 
 ```sql
 CREATE TABLE agents (
@@ -244,6 +245,84 @@ CREATE TABLE agent_inbox (
 ```
 
 `agent_inbox` is append-only. Rows MUST NOT be deleted or modified after insert. `delivered` is the only mutable field.
+
+### 3.3 Task Tracker Integration
+
+A **task tracker** is the external system from which the orchestrator pulls eligible work. The `units` row is a local mirror of an entry in some upstream tracker; the tracker is authoritative for issue state.
+
+#### 3.3.1 Tracker interface
+
+Every tracker plugin MUST implement:
+
+```go
+type Tracker interface {
+    // Identifies which tracker_kind values this implementation handles.
+    Kind() string
+
+    // Fetch eligible candidate units. Called every poll tick.
+    // The result is filtered locally before dispatch.
+    FetchCandidates(ctx context.Context, opts FetchOpts) ([]TrackerUnit, error)
+
+    // Re-fetch a single unit's authoritative state. Called between turns
+    // and during reconciliation.
+    FetchUnitState(ctx context.Context, trackerID string) (TrackerState, error)
+
+    // Optional: write the unit's state back (e.g. mark in-progress).
+    UpdateUnitState(ctx context.Context, trackerID string, state TrackerState) error
+}
+
+type TrackerUnit struct {
+    TrackerID    string            // external identifier
+    Title        string
+    Description  string
+    Priority     *int              // 1..4 or nil
+    Labels       []string
+    BlockedBy    []string          // upstream tracker IDs
+    Metadata     map[string]string // tracker-specific fields
+}
+
+type TrackerState struct {
+    Status   TrackerStatus // see § 3.3.2
+    UpdatedAt time.Time
+}
+```
+
+#### 3.3.2 Lifecycle states
+
+The tracker MUST report each unit's status as one of:
+
+| Status | Meaning | Eligible for dispatch? |
+|---|---|---|
+| `active` | Open, ready, in progress, queued | YES |
+| `blocked` | Waiting on upstream | NO (re-evaluated next tick) |
+| `done` | Completed, merged, closed-as-resolved | NO (terminal) |
+| `cancelled` | Closed-as-wontfix, deleted, archived | NO (terminal) |
+| `unknown` | Tracker returned a status the plugin couldn't classify | NO; logged as warning, treated as blocked |
+
+**Non-active** = anything except `active`. A unit becoming non-active mid-run triggers `ReconciliationCancel` (§ 9.2) and the attempt enters `AttemptCanceled`.
+
+#### 3.3.3 Built-in trackers
+
+| `tracker_kind` | Source |
+|---|---|
+| `linear` | Linear GraphQL API |
+| `github` | GitHub Issues + Projects |
+| `jira` | Jira REST v3 |
+| `sqlite` | Built-in local tracker — units defined in `.sf/tracker.toml`, stored in SQLite directly. Default for projects without an external tracker. |
+
+Additional trackers MAY be added via the `Tracker` plugin interface (§ 23).
+
+#### 3.3.4 ID mapping
+
+`units.tracker_kind` + `units.tracker_id` together identify the upstream entity. The harness MUST treat `(tracker_kind, tracker_id)` as a unique key — re-fetching the same upstream entity reuses the same `units.id`.
+
+#### 3.3.5 Failure handling
+
+Tracker errors do NOT crash the orchestrator (§ 20). Specifically:
+
+- `FetchCandidates` failure: skip this poll tick, retry next tick.
+- `FetchUnitState` failure mid-attempt: log warning, continue the turn loop. The next poll tick will re-fetch.
+- Persistent tracker outage: dispatched workers continue running on already-fetched state; no new dispatches occur until tracker recovers.
 
 ---
 
@@ -347,9 +426,25 @@ The harness MUST fail startup if a configured workflow template references an un
 ### 4.6 Phase transitions — implementation rules
 
 1. All phase transitions MUST go through a single `Harness.Transition(ctx, from, to, reason)` method.
-2. `Transition` MUST persist the `PhaseTransition` record to SQLite BEFORE the new phase begins. A crash mid-phase means on resume the harness re-enters the last committed phase cleanly.
+2. `Transition` MUST persist the `PhaseTransition` record to SQLite BEFORE the new phase begins. A crash mid-phase means on resume the harness re-enters the last committed phase cleanly (see § 4.7).
 3. `Transition` MUST emit a pubsub `PhaseChange` event after the SQLite write. The TUI subscribes — it MUST NOT poll phase state directly.
 4. The harness MUST set `Think: true` on the model config for `Research` and `Plan` phases. The agent does not control this.
+
+### 4.7 Crash recovery
+
+In-memory scheduler state is intentionally not persisted (§ 20.2). On restart, the orchestrator MUST follow this exact sequence:
+
+1. **Acquire process lock** at `~/.sf/run.lock` (PID file). Stale lock (PID not in `/proc`) is cleaned and logged.
+2. **Mark interrupted units.** All units with `phase_status = 'running'` are updated to `phase_status = 'interrupted'`. This is the only schema-level recovery action.
+3. **Run startup cleanup** (§ 5.6) — move stale active artifacts to archive.
+4. **Resume from the last committed phase boundary.** Each `interrupted` unit is treated as eligible for fresh dispatch; the worker re-enters at `unit.phase` with a new attempt number (`unit.attempt + 1`). The agent receives a `last_error` of `"resumed_after_crash"` so the prompt can warn the agent.
+5. **Begin polling.** Tracker reconciliation runs first to catch any status changes that happened during the outage.
+
+The harness MUST NOT replay tool calls. It MUST NOT attempt to "resume" a partial agent session. The crash recovery model is **fresh dispatch from the last persisted phase boundary**, not transparent continuation.
+
+**Side effects are not rolled back.** A crash mid-Merge may have produced a partial commit, push, or PR. The agent on retry sees the existing commits and either continues from there or surfaces a conflict. This MUST be documented in the Merge phase prompt: "if you see existing commits from a previous attempt, integrate them; do not start over."
+
+**Workspace state is preserved.** A crashed worker's workspace remains on disk; the next attempt reuses it (`ensure_workspace` returns `created=false`). The `before_run` hook is responsible for any cleanup (e.g. `git stash`, `npm clean`) appropriate for the project.
 
 ---
 
@@ -406,11 +501,22 @@ max_agents_by_phase.verify   = 10
 
 **After a normal (clean) exit** from a worker, the orchestrator MUST schedule a 1-second continuation retry to re-poll eligibility. If the unit is still active, a new session starts. If terminal, the claim is released. This is not a failure retry.
 
-**After an abnormal exit**, exponential backoff:
+**After an abnormal exit**, exponential backoff. `attempt` is 1-indexed (first try = 1, first retry = 2, …):
+
 ```
-delay = min(10s × 2^(attempt-1), max_retry_backoff)
+delay = min(10s × 2^(attempt - 1), max_retry_backoff)
 ```
-Default cap: 5 minutes. Configurable: `[harness] max_retry_backoff = "5m"`.
+
+| Attempt | Delay before next dispatch |
+|---|---|
+| 1 (first try) | (no retry yet) |
+| 2 (first retry) | 20 s |
+| 3 | 40 s |
+| 4 | 80 s |
+| 5 | 160 s |
+| 6+ | capped at `max_retry_backoff` (default 5 min) |
+
+Configurable: `[harness] max_retry_backoff = "5m"`, `[harness] max_attempts = 6`.
 
 ### 5.6 Startup cleanup
 
@@ -684,9 +790,9 @@ The payload is serialized to JSON and passed to hook subprocesses via stdin.
 
 - PostUnit hooks run **sequentially**, not concurrently. The next dispatch MUST NOT begin until all PostUnit hooks have returned.
 - A hook subprocess that exits non-zero for `PreDispatch` or `PostUnit` MUST trigger `SignalAbort`. The harness stops the session and marks it `SessionFailed`.
-- A hook that times out (default 30s, configurable) is killed and logged. A `PostUnit` hook timeout MUST NOT block the next dispatch.
+- A hook that times out (default 60s, configurable via `[harness.hooks] timeout_ms`) is killed and logged. A `PostUnit` hook timeout MUST NOT block the next dispatch.
 - The git service subscribes to PostUnit via a hook and handles commits, branch creation, and push. The harness MUST NOT call `git` directly.
-- hermes-memory feedback is emitted from a built-in PostUnit hook (not a subprocess) — it calls the memory API directly.
+- Hindsight feedback (retain learnings, mark anti-patterns) is emitted from a built-in PostUnit hook (not a subprocess) — it calls the Hindsight client directly.
 - PostUnit hook results MUST be written to the trace as child spans of the unit span.
 
 ### 10.4 Tool response contract
@@ -710,14 +816,20 @@ For successful calls: `success = true`, `output` = result summary. For unsupport
 
 If the agent calls a tool that is not registered, the harness MUST return a structured failure response and continue the session. It MUST NOT stall, panic, or exit on an unknown tool name.
 
-### 10.5 Doc sync hook (built-in)
+### 10.5 Doc sync (sub-step of PhaseMerge)
 
-After every `PhaseMerge`, the harness MUST dispatch a lightweight doc-sync unit. The agent checks whether the completed work requires updates to project-level docs (`ARCHITECTURE.md`, `CONVENTIONS.md`, `STACK.md`) and proposes edits as a diff to stdout. The harness surfaces proposed changes to the TUI for user approval before committing.
+Doc sync runs as the final sub-step of `PhaseMerge`, before transitioning to `PhaseComplete`. It is not a separate phase and not a post-merge hook; it is part of the Merge phase's contract.
 
-Rules:
-- Doc sync runs as a `fast`-tier dispatch.
-- If the agent finds nothing to update, it emits an empty diff and the hook is a no-op.
-- Doc sync MAY be disabled per-project: `[harness] doc_sync = false`.
+The doc-sync sub-step:
+
+1. Dispatches a `fast`-tier turn against the merged diff with a short prompt asking whether project-level docs (`ARCHITECTURE.md`, `CONVENTIONS.md`, `STACK.md`) need updating.
+2. The agent emits a diff (possibly empty) to stdout.
+3. If the diff is non-empty, the harness surfaces it to the TUI for user approval. On approval, it is committed as `docs: sync after {unit_id}` on the same branch and the merge hook is re-triggered.
+4. On empty diff, the sub-step is a no-op and PhaseMerge proceeds to PhaseComplete.
+
+Configuration:
+- `[harness] doc_sync = false` disables the sub-step entirely.
+- `[harness] doc_sync_auto_approve = true` skips the user prompt and commits the diff directly. Off by default.
 
 ---
 
@@ -862,11 +974,9 @@ When a slice or milestone reaches `PhaseComplete`, the harness MUST move its art
 
 `.sf/active/` holds only in-progress work. `.sf/archive/` is queried by `/sf history`.
 
-### 13.5 `specs.check` gate (built-in)
+### 13.5 Reserved
 
-At `PhaseVerify`, the harness MUST run an AST-based pass over all exported Go identifiers in the harness package. Any exported function, type, or constant missing a doc comment MUST fail the gate.
-
-Implemented as a `go/ast` walk — no external linter dependency. Applies to the harness package only, not extension or hook code.
+(`specs.check`, godoc enforcement on the harness package, is a singularity-crush CI requirement — see § 1 — not a runtime gate against user projects.)
 
 ---
 
@@ -883,14 +993,19 @@ Both files are TOML. Project overrides global on a per-key basis.
 
 ```toml
 [harness]
-context_compact_at  = 0.80
-context_hard_limit  = 0.95
-unit_timeout        = "10m"
-supervisor_interval = "10s"
-max_retry_backoff   = "5m"
-doc_sync            = true
-turn_input_required = "soft"    # or "hard"
-worktree_mode       = "branch-per-slice"
+context_compact_at    = 0.80
+context_hard_limit    = 0.95
+unit_timeout          = "10m"   # bounds one attempt: workspace creation through teardown
+turn_timeout          = "5m"    # bounds one model turn
+stall_timeout         = "2m"    # AttemptStalled when no agent event for this long
+max_turns_per_attempt = 50
+max_attempts          = 6       # exponential backoff before giving up
+hot_cache_turns       = 10      # in-memory recent-turn buffer
+supervisor_interval   = "10s"
+max_retry_backoff     = "5m"
+doc_sync              = true
+turn_input_required   = "soft"  # or "hard"
+worktree_mode         = "branch-per-slice"
 
 [harness.concurrency]
 max_agents                   = 10
@@ -1015,13 +1130,17 @@ Score mappings: `over=0.3` (over-resourced), `ok=0.8`, `under=0.0` (blocks model
 
 ### 16.1 Architecture
 
-The durable knowledge layer is **Hindsight** (vectorize-io/hindsight) — a production memory service accessible on the tailnet. singularity-crush uses `hindsight-client-go`.
+The knowledge layer is **Hindsight** ([vectorize-io/hindsight](https://github.com/vectorize-io/hindsight-cookbook)) — a memory service accessible on the tailnet. singularity-crush uses `hindsight-client-go`. There is no local vector store, no sqlite-vec table, no FTS5 fallback — all retrieval and persistence go through Hindsight.
 
-SQLite in singularity-crush holds ONLY: session state, planning data, phase transitions, benchmark scores, and a local memory cache. Knowledge MUST live in Hindsight, not in a SQLite table.
+SQLite in singularity-crush holds **orchestration state only** (sessions, units, blockers, gates, benchmarks, circuit breakers, agents). Memories, learnings, anti-patterns, and codebase context live in Hindsight.
+
+When Hindsight is unreachable, the harness MUST log a warning and dispatch with no recall context. The agent still runs; it just lacks historical memory for that session. The harness MUST NOT block dispatch on Hindsight availability.
 
 ### 16.2 Memory tiers
 
-**Hot cache** — last 10 turns of the current unit, held in memory (not SQLite). Never injected into the next unit's context. Cleared on compaction.
+Two tiers prevent token bloat during long-running sessions:
+
+**Hot cache** — current dispatch's recent turns held in memory (never persisted to SQLite). Configurable size: `[harness] hot_cache_turns = 10`. Cleared on compaction.
 
 **Hindsight store** — durable. PostUnit writes summaries, learnings, and anti-patterns. Pre-dispatch reads top-N most relevant entries. On compaction, the hot cache is summarised and written to Hindsight as a `session_summary` entry.
 
@@ -1082,24 +1201,18 @@ Entries with 10+ accesses gain a 7-day buffer against decay. Calling `validate()
 
 ### 16.7 Retrieval pipeline
 
-Two-stage pipeline:
+Retrieval is delegated to Hindsight via `hindsight.Recall(bank, query, opts)`. Hindsight runs its own internal pipeline — fused semantic + lexical retrieval, optional reranking, and decay weighting — and returns ranked entries. The harness does not implement a retrieval pipeline of its own.
 
-**Stage 1 — retrieval (broad, top 20–50 candidates):**
-1. Generate query embedding (Qwen3-Embedding-0.6B — fast, real-time).
-2. ANN search via `vector_top_k()`.
-3. FTS5 BM25 search in parallel.
-4. Reciprocal Rank Fusion: `rrf = 1/(60 + vector_rank) + 1/(60 + fts5_rank)`.
+Recall options the harness uses:
 
-**Stage 2 — reranking (precise, top 5–10 returned):**
-5. Send (query, document) pairs to reranker.
-   - `Qwen3-Reranker-0.6B` — default, fast, used for most queries.
-   - `Qwen3-Reranker-4B` — used for pre-dispatch context injection where quality matters most.
-6. Apply decay: `finalScore = rerankerScore * decayFactor`.
-7. Filter deprecated and below-threshold entries.
-8. Apply maturity weights.
-9. Return top N sorted by `finalScore`.
+| Option | Use |
+|---|---|
+| `top_k` | Number of entries to inject into prompt (default 5) |
+| `bank` | `project/{hash}` or `global/coding` (§ 16.3) |
+| `filter` | Tag filters (e.g. `collection=anti_patterns`) |
+| `rerank_quality` | `fast` (routine) or `accurate` (pre-dispatch context injection) |
 
-Graceful degradation: if the embedding endpoint is unreachable, MUST fall back to FTS5-only search.
+The harness applies its own maturity and anti-pattern weighting (§ 16.4, § 16.5) by tagging entries on retain and filtering / re-ordering on recall — Hindsight stores the metadata but does not interpret it.
 
 ### 16.8 `sf init`
 
@@ -1118,7 +1231,25 @@ Deep analysis is default, not opt-in:
 
 ### 17.1 Agent vs unit
 
-A **unit** is ephemeral work within a session. A **persistent agent** is a named identity that persists indefinitely: it has its own memory blocks, system prompt, and message history. It sleeps at zero cost when idle and wakes when its inbox receives a message.
+A **unit** is ephemeral work pulled from a tracker (§ 3.3) and driven through the phase state machine (§ 4). It is archived on completion.
+
+A **persistent agent** is a named, long-lived identity: it has its own memory blocks, system prompt, and message history. It sleeps at zero cost when idle and wakes when its inbox receives a message or an explicit `/sf agent run <name>` is issued.
+
+**A persistent agent run is NOT a unit.** Specifically:
+
+| Aspect | Unit | Persistent agent run |
+|---|---|---|
+| Source of work | Tracker (§ 3.3) | Inbox message or explicit `/sf agent run` |
+| Phase state machine | YES | NO |
+| Verification gates | YES | NO |
+| Workflow templates | YES | NO |
+| PostUnit hooks | YES | NO (replaced by `PostAgentRun`) |
+| `before_run` / `after_run` workspace hooks | YES | YES (shared lifecycle) |
+| Supervisor checks (StuckLoop, AbandonDetect, BudgetWarning) | YES | YES |
+| Crash recovery | re-dispatch from last phase | re-deliver undelivered inbox |
+| Budget instance | fresh per attempt | persistent across runs (until reset) |
+
+What they share: the worker attempt lifecycle (§ 6) — workspace creation, `before_run` hook, agent session, turn loop, `after_run` hook — is identical. The supervisor goroutine monitors agent runs and unit attempts with the same checks. The trace records both as runs with distinct `run_kind` attributes.
 
 ### 17.2 Memory block injection
 
@@ -1158,11 +1289,11 @@ The harness owns all state transitions. The agent loop MUST NOT write `AgentStat
 
 ### 17.5 Agent fleet supervision
 
-Every agent run is wrapped by the same harness that wraps single-agent units:
-- Budget tracking and compaction fire per-agent, not globally.
-- The supervisor monitors all running agents; `StuckLoop` and `AbandonDetect` apply independently.
-- Crash recovery restores each agent to its last committed message sequence independently.
-- Cost is recorded per agent in the trace.
+Each persistent agent has its own `Budget` instance (§ 8) that persists across runs and is reset only on explicit `/sf agent reset <name>`. Compaction fires per-agent — when one agent's budget hits the compact threshold, only its hot cache is summarised; other agents are unaffected.
+
+Crash recovery for agents differs from unit recovery (§ 4.7): on restart, each agent's `agent_inbox` is rescanned for `delivered = 0` rows. Any such rows trigger an immediate `AgentWake` — the agent resumes processing the queue. There is no phase to resume; the inbox IS the resumption state.
+
+The trace records each agent run as a separate root span with `run_kind = "agent"` and `agent_id = <id>`. `/sf session-report` breaks down spend by agent.
 
 ---
 
@@ -1343,7 +1474,7 @@ Every harness failure has a class. The class determines recovery behavior.
 
 | Class | Examples | Recovery |
 |---|---|---|
-| `config` | Missing WORKFLOW.md, invalid TOML, unknown tracker kind, missing API key | Block new dispatches. Keep service alive. Continue reconciliation. Emit operator-visible error. |
+| `config` | Missing or invalid `.sf/workflows/*.toml`, invalid `.sf/config.toml`, unknown tracker kind, missing API key | Block new dispatches. Keep service alive. Continue reconciliation. Emit operator-visible error. |
 | `workspace` | Directory creation failure, hook timeout, invalid path | Fail the current attempt. Orchestrator retries with backoff. |
 | `agent_session` | Startup handshake failed, turn timeout, turn cancelled, subprocess exit, stalled session, `turn_input_required` (hard mode) | Fail the current attempt. Orchestrator retries with backoff. |
 | `tracker` | API transport error, non-200, GraphQL errors, malformed payload | **Candidate fetch failure**: skip this tick. **Reconciliation failure**: keep workers running, retry next tick. |
@@ -1353,7 +1484,7 @@ Every harness failure has a class. The class determines recovery behavior.
 
 ```go
 const (
-    ErrMissingWorkflowFile      = "missing_workflow_file"
+    ErrMissingWorkflowFile      = "missing_workflow_file"   // .sf/workflows/<name>.toml not found
     ErrWorkflowParseError       = "workflow_parse_error"
     ErrUnsupportedTrackerKind   = "unsupported_tracker_kind"
     ErrMissingTrackerKey        = "missing_tracker_api_key"
@@ -1672,10 +1803,16 @@ Use this checklist as the definition-of-done for each build phase. An implementa
 - [ ] **C-34** Intent chapters: open/close with intent summary; used for crash recovery context and Hindsight recall.
 - [ ] **C-35** Typed error codes; matching on error strings PROHIBITED.
 - [ ] **C-36** Scheduler state intentionally in-memory; restart re-dispatches from fresh poll.
-- [ ] **C-37** `specs.check` gate: AST-based godoc enforcement on all exported harness identifiers.
+- [ ] **C-37** Project CI runs `specs.check`: AST-based godoc enforcement on all exported identifiers in singularity-crush's own harness packages. (Not a user-project runtime gate.)
 - [ ] **C-38** Vault secret resolution: `vault://path#field` URI scheme; auth chain: `VAULT_TOKEN` → `~/.vault-token` → AppRole; secrets MUST NOT be written to disk or logged.
 - [ ] **C-39** PhaseReview chunked at ≤ 300 lines per chunk.
 - [ ] **C-40** Unit archive: `.sf/active/` → `.sf/archive/{date}-{unit-id}/` on `PhaseComplete` via atomic rename.
+- [ ] **C-41** Tracker interface: `Kind`, `FetchCandidates`, `FetchUnitState`, `UpdateUnitState`; status enum `active | blocked | done | cancelled | unknown`; built-in `linear`, `github`, `jira`, `sqlite` adapters; `(tracker_kind, tracker_id)` is the unique upstream key.
+- [ ] **C-42** Tracker failures never crash the orchestrator: candidate-fetch failure skips tick; state-fetch failure mid-attempt logs and continues turn loop.
+- [ ] **C-43** Crash recovery: `running` units → `interrupted` on startup; re-dispatch fresh from last persisted phase boundary with `last_error = "resumed_after_crash"`; tool calls NOT replayed; agent sessions NOT resumed.
+- [ ] **C-44** Process lock at `~/.sf/run.lock`; stale-lock cleanup via `/proc` PID check.
+- [ ] **C-45** Doc-sync runs as a sub-step of `PhaseMerge` (not a separate phase, not a post-merge dispatch); empty diff is a no-op; user approval required unless `doc_sync_auto_approve = true`.
+- [ ] **C-46** SQLite is orchestration-only — no `memories` table, no vector index. Knowledge MUST live in Hindsight.
 
 ### 26.2 Knowledge layer (ship after core)
 
@@ -1684,7 +1821,7 @@ Use this checklist as the definition-of-done for each build phase. An implementa
 - [ ] **K-03** Anti-pattern library: `collection: anti_patterns`; never decay; surfaced in dedicated `<anti_patterns>` block.
 - [ ] **K-04** Pattern maturation: 4 states (candidate → established → proven → deprecated); weights as specified.
 - [ ] **K-05** Confidence decay: `halfLife = 90 * (0.5 + confidence)` days.
-- [ ] **K-06** Two-stage retrieval: RRF (vector + FTS5) → reranker; FTS5 fallback when embedding endpoint unreachable.
+- [ ] **K-06** Hindsight is the sole knowledge backend; on Hindsight outage, dispatch proceeds with empty recall and a logged warning.
 - [ ] **K-07** `sf init` deep analysis default; `--quick` skips Hindsight indexing.
 
 ### 26.3 Model routing (ship after core)
